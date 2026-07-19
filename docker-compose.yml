@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: fno_db
+    restart: always
+    environment:
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres_pass}
+      POSTGRES_DB: ${DB_NAME:-fno_db}
+    ports:
+      - "5430:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+  app:
+    build: .
+    container_name: fno_app
+    restart: always
+    depends_on:
+      - db
+    volumes:
+      - ./sessions:/app/sessions
+      - .:/app
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python main.py worker
+
+volumes:
+  pg_data:
