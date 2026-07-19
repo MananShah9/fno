@@ -113,6 +113,24 @@ Docker-Compose automatically spins up PostgreSQL and boots the Python background
    docker-compose logs -f app
    ```
 
+**First-time Docker setup (interactive Telegram auth)**
+
+If this is the first time you're running the system in Docker, complete the Telegram authorization interactively from the host so the session file is created and persisted into the `sessions/` folder (which should be mounted into the container).
+
+1. Start the containers (database + app):
+```bash
+docker-compose up -d --build
+```
+2. Run the interactive CLI inside the app container and run the setup flow:
+```bash
+docker exec -it fno_app python main.py cli
+```
+3. In the CLI select **`[1] Setup & Telegram Authorization`** and follow the prompts to authenticate with Telegram. This creates `sessions/telegram_user.session` on the host.
+4. After completing the authorization, restart the app container so the worker picks up the new session:
+```bash
+docker restart fno_app
+```
+
 *Note: Since the docker worker runs non-interactively, ensure you have already completed the Telegram Auth step locally so that the `sessions/` folder (mounted into the container) contains your authenticated session.*
 
 ---
