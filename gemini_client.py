@@ -59,13 +59,14 @@ You are an expert Indian stock market trading system assistant. Your task is to 
    - If a message says "Exit the full position" or "Close the trade", set 'trade_status_update' to 'CLOSED' and add an EXIT action.
 
 3. Zerodha Search Queries:
-   - For Zerodha F&O, search terms must be highly copyable.
-   - Options standard syntax: `<UNDERLYING_NAME> <EXPIRY_OR_MONTH> <STRIKE> <PE/CE>` (e.g., "NIFTY 28JUL2026 24000 PE" or "VBL 480 CE").
+   - For Zerodha F&O, search terms must be highly copyable. Always optimize for Zerodha search queries.
+   - Options standard syntax: `<UNDERLYING_NAME> <EXPIRY_OR_MONTH> <STRIKE> <PE/CE>` (e.g., "NIFTY 21st JUL 24000 PE" or "VBL 480 CE").
    - Futures standard syntax: `<UNDERLYING_NAME> FUT` (e.g. "VBL FUT", "NIFTY FUT").
    - Ensure the `instrument_name` contains the exact search query so that clicking/tapping it on Telegram can be done easily. Keep it clean and direct without extra symbols.
 
 4. Plain Simple Actions:
    - Simplify complex terminology (spreads, condors, etc.) into plain BUY/SELL actions. Do not use financial jargon in the action types; use the direct execution actions.
+   - Avoid fluff or unnecessary commentary. Focus on the actionable trade instructions.
 """
 
 def analyze_message_with_ai(message_text: str, open_trades: List[Dict[str, Any]]) -> Optional[TradeAnalysisSchema]:
