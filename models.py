@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, ForeignKey
+from sqlalchemy import Column, Integer, Float, String, Boolean, DateTime, Text, ForeignKey
 from sqlalchemy.orm import relationship
 from db import Base
 
@@ -56,9 +56,26 @@ class Action(Base):
     details = Column(Text, nullable=True)
     telegram_sent = Column(Boolean, default=False, index=True)
 
+    # Zerodha Execution Parameters
+    underlying = Column(String, nullable=True)
+    option_type = Column(String, nullable=True)
+    strike = Column(Float, nullable=True)
+    expiry = Column(String, nullable=True)
+    lots = Column(Integer, default=1)
+    quantity = Column(Integer, nullable=True)
+    tradingsymbol = Column(String, nullable=True)
+    instrument_token = Column(Integer, nullable=True)
+    transaction_type = Column(String, nullable=True)  # "BUY" or "SELL"
+    order_type = Column(String, nullable=True)        # "MARKET" or "LIMIT"
+    product = Column(String, default="NRML")           # "NRML" or "MIS"
+    order_status = Column(String, default="PENDING", index=True)  # "PENDING", "PLACED", "FAILED", "EXECUTED", "CANCELLED"
+    zerodha_order_id = Column(String, nullable=True)
+    zerodha_response = Column(Text, nullable=True)
+    placed_at = Column(DateTime, nullable=True)
+
     # Relationships
     trade = relationship("Trade", back_populates="actions")
     message = relationship("Message", back_populates="actions")
 
     def __repr__(self):
-        return f"<Action(id={self.id}, type={self.action_type}, instrument={self.instrument_name}, sent={self.telegram_sent})>"
+        return f"<Action(id={self.id}, type={self.action_type}, symbol={self.tradingsymbol}, status={self.order_status})>"

@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import logging
 from typing import List, Dict, Any, Optional
 import google.generativeai as genai
@@ -20,53 +21,53 @@ if api_key:
 else:
     logger.warning("GEMINI_API_KEY is not set in environment!")
 
+def clean_symbol(symbol: Optional[str]) -> Optional[str]:
+    """Cleans up AI-generated underlying symbol to a strict single uppercase ticker."""
+    if not symbol:
+        return None
+    s = str(symbol).strip().upper()
+    # If symbol contains text like "TATASTEEL league/index..." or "NIFTY strategy...", extract first token
+    match = re.search(r'^[A-Z0-9]+', s)
+    if match:
+        return match.group(0)
+    return s[:20]
+
 # Define structured schema
 class ActionSchema(BaseModel):
     action_type: str = Field(description="Must be one of: BUY, SELL, EXIT, UPDATE_SL, CLOSE_LEG, INFO")
-    instrument_name: Optional[str] = Field(description="The exact copyable search query on Zerodha. Options syntax: '<UNDERLYING> <STRIKE> <PE/CE>' or '<UNDERLYING> <EXPIRY_DATE> <STRIKE> <PE/CE>' (e.g. 'NIFTY 28JUL2026 24000 PE' or 'VBL 480 CE'). Futures: '<UNDERLYING> FUT' (e.g. 'VBL FUT', 'NIFTY FUT').")
-    price: Optional[str] = Field(description="Execution price, entry range, or limit, e.g. '183' or '467-468' or '81'")
+    underlying: Optional[str] = Field(description="Underlying index or stock symbol ONLY in uppercase, e.g. 'NIFTY', 'BANKNIFTY', 'VBL', 'INDIGO', 'RELIANCE', 'TATASTEEL'. Do NOT include any explanations or reasoning.")
+    option_type: Optional[str] = Field(description="Instrument option type: 'CE', 'PE', or 'FUT'")
+    strike: Optional[float] = Field(description="Numeric strike price if option, e.g. 24000, 23600, 480, 5300, 192.5. Null for Futures.")
+    expiry_info: Optional[str] = Field(description="Expiry date or month string if mentioned, e.g. '28JUL', 'AUG', '4AUG', '11AUG', 'JULY'. Null if default/nearest.")
+    order_type: Optional[str] = Field(description="Zerodha order type: 'MARKET' or 'LIMIT'. If a specific limit price or range is provided, set 'LIMIT'. Otherwise 'MARKET'.")
+    product: Optional[str] = Field(description="Product code: 'NRML' for overnight/positional trades, 'MIS' if explicitly intraday.")
+    lots: Optional[int] = Field(description="Number of lots to trade, default 1 unless specified (e.g. 2 lots, add 1 lot).")
+    instrument_name: Optional[str] = Field(description="The exact copyable search query on Zerodha. Options syntax: '<UNDERLYING> <EXPIRY> <STRIKE> <PE/CE>' (e.g. 'NIFTY 28JUL2026 24000 PE' or 'VBL 480 CE'). Futures: '<UNDERLYING> FUT' (e.g. 'VBL FUT', 'NIFTY FUT').")
+    price: Optional[str] = Field(description="Execution price, entry range, or limit, e.g. '183' or '467-468' or '81' or '4.5-4.7'")
     stoploss: Optional[str] = Field(description="Stoploss value or trigger price, e.g. '220' or '475'")
     target: Optional[str] = Field(description="Target price, e.g. '453' or '3.9'")
-    is_limit: bool = Field(description="True if limit order specified, False if market/at-the-money or range not requiring a hard limit")
+    is_limit: Optional[bool] = Field(description="True if limit order specified, False if market/at-the-money or range not requiring a hard limit")
     details: Optional[str] = Field(description="Brief note explaining the execution instructions for this leg/order")
 
 class TradeAnalysisSchema(BaseModel):
     is_valid_trade_msg: bool = Field(description="True if this message represents a valid trade setup, entry, modification, stoploss update, target update, or exit/close alert. False if it is general talk, FYI, or unrelated.")
     is_continuation: bool = Field(description="True if this message updates or closes a trade from the provided 'Open Trades Context' (e.g. updates stoploss, closes a position, target hit).")
     related_open_trade_id: Optional[int] = Field(description="The 'id' of the related open trade from the provided 'Open Trades Context', if is_continuation is True.")
-    structure_type: Optional[str] = Field(description="The overall strategy structure, e.g., 'NIFTY PE SPREAD', 'VBL BEAR FUT SPREAD', 'SINGLE CE BUY', 'IRON CONDOR'.")
-    underlying: Optional[str] = Field(description="Underlying security, e.g., 'NIFTY', 'VBL', 'BANKNIFTY'")
+    structure_type: Optional[str] = Field(description="The overall strategy structure, e.g., 'TATASTEEL BULL PUT SPREAD', 'NIFTY PE SPREAD', 'SINGLE CE BUY'.")
+    underlying: Optional[str] = Field(description="Underlying ticker symbol ONLY in uppercase, e.g. 'TATASTEEL', 'NIFTY', 'VBL', 'BANKNIFTY'. ABSOLUTELY NO reasoning or extra text.")
     actions: List[ActionSchema] = Field(description="The list of orders or actions to execute for this trade message.")
     trade_status_update: str = Field(description="If this message closes or exits the entire trade, set this to 'CLOSED'. Otherwise, keep it 'OPEN'.")
-    context_summary: Optional[str] = Field(description="A highly summarized, clear explanation of the overall trade state after processing this message (e.g. 'Spread opened: Sell 24000 PE @ 183, Buy 23600 PE @ 81. SL 220'). This will be used as history context for subsequent messages.")
+    context_summary: Optional[str] = Field(description="A highly summarized, clear explanation (under 50 words) of the overall trade state after processing this message.")
 
 
 SYSTEM_INSTRUCTION = """
 You are an expert Indian stock market trading system assistant. Your task is to process incoming messages from a trading Telegram channel and structure them into highly actionable trading data.
 
-### Trading Types & Conventions:
-1. Spreads / Multi-Leg Trades (e.g., Bear Put Spread, Bull Call Spread, Iron Condor, Straddle, Strangle):
-   - These are SINGLE trades that contain MULTIPLE legs/orders.
-   - For example:
-     - BUY NIFTY 23600 PE @ 81
-     - SELL NIFTY 24000 PE @ 183
-   - Represent these as ONE single trade (TradeAnalysisSchema) containing MULTIPLE actions (ActionSchema).
-
-2. Continuations and Updates:
-   - Subsequent messages are often updates on existing open trades (e.g., "SL for entire position in when 24000 PE hits 220", "SL hit Exit the full position", "Close the future position at or below 461.9").
-   - You MUST examine the provided 'Open Trades Context' to find which open trade this message refers to.
-   - Identify the correct 'related_open_trade_id' and map the actions to it.
-   - If a message says "Exit the full position" or "Close the trade", set 'trade_status_update' to 'CLOSED' and add an EXIT action.
-
-3. Zerodha Search Queries:
-   - For Zerodha F&O, search terms must be highly copyable. Always optimize for Zerodha search queries.
-   - Options standard syntax: `<UNDERLYING_NAME> <EXPIRY_OR_MONTH> <STRIKE> <PE/CE>` (e.g., "NIFTY 21st JUL 24000 PE" or "VBL 480 CE").
-   - Futures standard syntax: `<UNDERLYING_NAME> FUT` (e.g. "VBL FUT", "NIFTY FUT").
-   - Ensure the `instrument_name` contains the exact search query so that clicking/tapping it on Telegram can be done easily. Keep it clean and direct without extra symbols.
-
-4. Plain Simple Actions:
-   - Simplify complex terminology (spreads, condors, etc.) into plain BUY/SELL actions. Do not use financial jargon in the action types; use the direct execution actions.
-   - Avoid fluff or unnecessary commentary. Focus on the actionable trade instructions.
+CRITICAL CONSTRAINTS:
+1. `underlying` MUST be strictly a single uppercase ticker symbol string, e.g. "TATASTEEL", "NIFTY", "BANKNIFTY", "INDIGO", "VBL", "RELIANCE". NEVER include reasoning, markdown, code, or extra words in `underlying`.
+2. Extract ALL actionable order legs into the `actions` array. For spreads (e.g. Bull Put Spread), extract both Sell and Buy legs as separate ActionSchema items.
+3. If a price range is specified (e.g. "@ Range (4.5-4.7) Place limit orders"), set `order_type = 'LIMIT'`, `is_limit = True`, and `price = '4.5-4.7'`.
+4. Keep `context_summary` extremely concise (under 50 words).
 """
 
 def analyze_message_with_ai(message_text: str, open_trades: List[Dict[str, Any]]) -> Optional[TradeAnalysisSchema]:
@@ -112,6 +113,35 @@ Please analyze the message above against the active open trades and return a hig
 
         # Parse the JSON response
         result_json = json.loads(response.text)
+        
+        # Populate safe defaults if Gemini omitted optional schema keys
+        if "actions" not in result_json or result_json["actions"] is None:
+            result_json["actions"] = []
+        if "is_continuation" not in result_json or result_json["is_continuation"] is None:
+            result_json["is_continuation"] = False
+        if "trade_status_update" not in result_json or result_json["trade_status_update"] is None:
+            result_json["trade_status_update"] = "OPEN"
+        if "is_valid_trade_msg" not in result_json or result_json["is_valid_trade_msg"] is None:
+            result_json["is_valid_trade_msg"] = False
+        if "related_open_trade_id" not in result_json:
+            result_json["related_open_trade_id"] = None
+        if "structure_type" not in result_json:
+            result_json["structure_type"] = None
+        if "underlying" not in result_json:
+            result_json["underlying"] = None
+        else:
+            result_json["underlying"] = clean_symbol(result_json["underlying"])
+
+        if "context_summary" not in result_json:
+            result_json["context_summary"] = None
+        elif result_json["context_summary"]:
+            result_json["context_summary"] = str(result_json["context_summary"])[:300]
+
+        if "actions" in result_json and isinstance(result_json["actions"], list):
+            for act in result_json["actions"]:
+                if isinstance(act, dict) and "underlying" in act:
+                    act["underlying"] = clean_symbol(act["underlying"])
+
         return TradeAnalysisSchema(**result_json)
 
     except Exception as e:

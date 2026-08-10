@@ -41,17 +41,47 @@ def init_db():
     # This will create tables if they do not exist
     Base.metadata.create_all(bind=engine)
     
-    # Ensure analysed_by_ai column exists in messages table
     inspector = inspect(engine)
+    
+    # 1. Ensure analysed_by_ai column exists in messages table
     if 'messages' in inspector.get_table_names():
         columns = [col['name'] for col in inspector.get_columns('messages')]
         if 'analysed_by_ai' not in columns:
             print("[*] Migration: Adding analysed_by_ai column to messages table...")
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE messages ADD COLUMN analysed_by_ai BOOLEAN DEFAULT FALSE"))
-                # Create index as well
                 try:
                     conn.execute(text("CREATE INDEX ix_messages_analysed_by_ai ON messages (analysed_by_ai)"))
                 except Exception as ie:
                     print(f"Index creation warning/error: {ie}")
             print("[+] Migration completed successfully.")
+
+    # 2. Ensure Zerodha execution columns exist in actions table
+    if 'actions' in inspector.get_table_names():
+        existing_cols = [col['name'] for col in inspector.get_columns('actions')]
+        new_cols = {
+            "underlying": "VARCHAR",
+            "option_type": "VARCHAR",
+            "strike": "DOUBLE PRECISION",
+            "expiry": "VARCHAR",
+            "lots": "INTEGER DEFAULT 1",
+            "quantity": "INTEGER",
+            "tradingsymbol": "VARCHAR",
+            "instrument_token": "INTEGER",
+            "transaction_type": "VARCHAR",
+            "order_type": "VARCHAR",
+            "product": "VARCHAR DEFAULT 'NRML'",
+            "order_status": "VARCHAR DEFAULT 'PENDING'",
+            "zerodha_order_id": "VARCHAR",
+            "zerodha_response": "TEXT",
+            "placed_at": "TIMESTAMP"
+        }
+
+        with engine.begin() as conn:
+            for col_name, col_type in new_cols.items():
+                if col_name not in existing_cols:
+                    print(f"[*] Migration: Adding {col_name} column to actions table...")
+                    try:
+                        conn.execute(text(f"ALTER TABLE actions ADD COLUMN {col_name} {col_type}"))
+                    except Exception as me:
+                        print(f"Migration column error ({col_name}): {me}")

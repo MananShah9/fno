@@ -19,6 +19,13 @@ def load_config():
         "DB_USER": os.getenv("DB_USER", "postgres"),
         "DB_PASSWORD": os.getenv("DB_PASSWORD", "postgres_pass"),
         "DB_NAME": os.getenv("DB_NAME", "fno_db"),
+        "ZERODHA_API_KEY": os.getenv("ZERODHA_API_KEY"),
+        "ZERODHA_API_SECRET": os.getenv("ZERODHA_API_SECRET"),
+        "ZERODHA_USER_ID": os.getenv("ZERODHA_USER_ID"),
+        "ZERODHA_PASSWORD": os.getenv("ZERODHA_PASSWORD"),
+        "ZERODHA_EXTERNAL_2FA_TOTP": os.getenv("ZERODHA_EXTERNAL_2FA_TOTP"),
+        "ZERODHA_PROXY_URL": os.getenv("ZERODHA_PROXY_URL", "http://100.125.89.97:8888"),
+        "AUTO_PLACE_ORDERS": os.getenv("AUTO_PLACE_ORDERS", "false").lower() in ("true", "1", "t", "yes"),
     }
 
 def update_env_variable(key: str, value: str):
