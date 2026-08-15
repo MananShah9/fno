@@ -29,6 +29,7 @@ def load_config():
         "AUTO_PLACE_ORDERS": os.getenv("AUTO_PLACE_ORDERS", "false").lower() in ("true", "1", "t", "yes"),
         "AUTO_PLACE_EXIT_ORDERS": os.getenv("AUTO_PLACE_EXIT_ORDERS", "false").lower() in ("true", "1", "t", "yes"),
         "TARGET_INVESTMENT_BUDGET": os.getenv("TARGET_INVESTMENT_BUDGET", "100000"),
+        "LOG_LEVEL": os.getenv("LOG_LEVEL", "INFO").upper(),
     }
 
 def update_env_variable(key: str, value: str):

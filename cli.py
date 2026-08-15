@@ -217,10 +217,11 @@ def manage_config_menu():
         print(f"10. AUTO_PLACE_ORDERS:     {cfg['AUTO_PLACE_ORDERS']}")
         print(f"11. AUTO_PLACE_EXIT_ORDERS: {cfg['AUTO_PLACE_EXIT_ORDERS']}")
         print(f"12. TARGET_INVESTMENT_BUDGET: Rs. {cfg.get('TARGET_INVESTMENT_BUDGET', '100000')}")
-        print(f"13. 🔙 Return to Main Menu")
+        print(f"13. LOG_LEVEL:                {cfg.get('LOG_LEVEL', 'INFO')}")
+        print(f"14. 🔙 Return to Main Menu")
         
-        choice = input("\nSelect setting to edit (1-13): ").strip()
-        if choice == '13':
+        choice = input("\nSelect setting to edit (1-14): ").strip()
+        if choice == '14':
             break
             
         env_map = {
@@ -235,7 +236,8 @@ def manage_config_menu():
             '9': 'GEMINI_MODEL',
             '10': 'AUTO_PLACE_ORDERS',
             '11': 'AUTO_PLACE_EXIT_ORDERS',
-            '12': 'TARGET_INVESTMENT_BUDGET'
+            '12': 'TARGET_INVESTMENT_BUDGET',
+            '13': 'LOG_LEVEL'
         }
         
         if choice in env_map:

@@ -18,8 +18,11 @@ from zerodha_client import place_zerodha_order, check_existing_zerodha_order_or_
 load_dotenv()
 
 # Setup Logging
+raw_log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+log_level = getattr(logging, raw_log_level, logging.INFO)
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=log_level,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout)
