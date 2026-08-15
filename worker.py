@@ -6,7 +6,7 @@ import json
 from datetime import datetime
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
-from telethon import events, Button
+from telethon import events, Button, utils
 
 import db
 from models import Message, Trade, Action
@@ -498,7 +498,7 @@ def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = Fal
 
     return results
 
-# Register Telethon Callback Handler for Telegram "Place Order(s)" inline button
+# Register Telethon Callback Handler for Telegram "Place Order(s)" inline button and MessageEdited events
 def setup_telegram_event_handlers():
     if not client:
         return
@@ -544,6 +544,222 @@ def setup_telegram_event_handlers():
         except Exception as e:
             logger.exception(f"Error handling CallbackQuery: {e}")
             await event.respond(f"❌ Execution error: {e}")
+
+    @client.on(events.MessageEdited)
+    async def on_message_edited_callback(event):
+        try:
+            msg = event.message
+            if not msg or not msg.text:
+                return
+
+            source_channel_id = os.getenv("TELEGRAM_SOURCE_CHANNEL")
+            if not source_channel_id:
+                return
+
+            # Check if edit belongs to source channel
+            source_entity = await get_channel_entity(source_channel_id)
+            if not source_entity:
+                return
+
+            source_peer_id = utils.get_peer_id(source_entity)
+            event_peer_id = utils.get_peer_id(event.chat_id) if event.chat_id else None
+
+            source_clean = str(source_channel_id).replace("-100", "").replace("-", "").strip()
+            chat_clean = str(event.chat_id).replace("-100", "").replace("-", "").strip() if event.chat_id else ""
+
+            is_match = (
+                (event_peer_id and event_peer_id == source_peer_id) or
+                (chat_clean and source_clean and chat_clean == source_clean) or
+                (getattr(source_entity, "id", None) == getattr(event.chat, "id", None))
+            )
+            if not is_match:
+                return
+
+            logger.info(f"✏️ Message edit detected for Message ID {msg.id} in source channel.")
+
+            session = db.SessionLocal()
+            try:
+                # Look up existing message in DB
+                db_message = session.query(Message).filter(
+                    Message.telegram_message_id == msg.id
+                ).first()
+
+                if db_message:
+                    # Check if this message produced action items (Action records in DB)
+                    action_count = session.query(Action).filter(Action.message_id == db_message.id).count()
+                    if action_count > 0:
+                        logger.info(
+                            f"Message ID {msg.id} (DB ID {db_message.id}) was already processed as an ACTION ITEM "
+                            f"({action_count} actions exist). Skipping reprocessing."
+                        )
+                        return
+
+                    logger.info(
+                        f"Message ID {msg.id} (DB ID {db_message.id}) was a poke / non-action / unprocessed message. "
+                        f"Updating content and reprocessing through full pipeline."
+                    )
+                    db_message.text = msg.text
+                    db_message.processed = False
+                    db_message.analysed_by_ai = False
+                    db_message.ai_response = None
+                    session.commit()
+                else:
+                    logger.info(f"Edited Message ID {msg.id} was not present in DB. Creating new record for processing.")
+                    db_message = Message(
+                        telegram_message_id=msg.id,
+                        channel_id=str(source_channel_id),
+                        date=msg.date or datetime.utcnow(),
+                        text=msg.text,
+                        processed=False,
+                        analysed_by_ai=False
+                    )
+                    session.add(db_message)
+                    session.commit()
+                    session.refresh(db_message)
+
+                # Mirror updated message if mirror channel is configured
+                mirror_channel_id = os.getenv("TELEGRAM_MIRROR_CHANNEL")
+                if mirror_channel_id:
+                    mirror_entity = await get_channel_entity(mirror_channel_id)
+                    if mirror_entity:
+                        try:
+                            await client.send_message(mirror_entity, f"✏️ [UPDATED MESSAGE]\n{msg.text}")
+                            logger.info(f"Mirrored updated message ID {msg.id}")
+                        except Exception as me:
+                            logger.error(f"Failed to mirror updated message ID {msg.id}: {me}")
+
+                # Process the updated message through full flow
+                actions_channel_id = os.getenv("TELEGRAM_ACTIONS_CHANNEL")
+                actions_entity = await get_channel_entity(actions_channel_id) if actions_channel_id else None
+                await process_single_message(session, db_message, actions_entity)
+
+            finally:
+                session.close()
+
+        except Exception as e:
+            logger.exception(f"Error handling MessageEdited event: {e}")
+
+async def process_single_message(session: Session, db_message: Message, actions_entity=None) -> bool:
+    """
+    Executes Gemini AI analysis, trade creation/matching, lot sizing, order execution,
+    and Telegram action notification for a single Message record.
+    Returns True if processed successfully, False otherwise.
+    """
+    session.refresh(db_message)
+    if db_message.analysed_by_ai:
+        logger.info(f"Message ID {db_message.id} (TG ID: {db_message.telegram_message_id}) is already analysed. Skipping.")
+        return True
+
+    if is_poke_message(db_message.text):
+        logger.info(f"Message ID {db_message.id} is a poke message ('{db_message.text.strip()}'). Skipping processing.")
+        db_message.analysed_by_ai = True
+        db_message.processed = True
+        db_message.processed_at = datetime.utcnow()
+        session.commit()
+        return True
+
+    logger.info(f"Analyzing message ID {db_message.id} (TG ID: {db_message.telegram_message_id or 'N/A'})...")
+    
+    # Fetch open trades context and send to Gemini
+    open_trades = get_open_trades_context(session)
+    analysis = analyze_message_with_ai(db_message.text, open_trades)
+
+    if not analysis:
+        logger.error(f"Failed to analyze message ID {db_message.id} with AI. Skipping and keeping it unanalysed for retry.")
+        return False
+
+    db_message.ai_response = json.dumps(analysis.model_dump(), default=str)
+    
+    if analysis.is_valid_trade_msg:
+        logger.info(f"Valid trade detected by AI for message ID {db_message.id}.")
+        
+        trade = None
+        # Is it a continuation? Try to find existing open trade
+        if analysis.is_continuation and analysis.related_open_trade_id:
+            trade = session.query(Trade).filter(Trade.id == analysis.related_open_trade_id).first()
+            if trade:
+                logger.info(f"Mapping message ID {db_message.id} to existing Trade ID {trade.id}")
+        
+        # Create new trade if not a continuation or parent trade not found
+        if not trade:
+            trade = Trade(
+                status="OPEN",
+                structure_type=analysis.structure_type,
+                underlying=clean_symbol(analysis.underlying),
+                opened_at=db_message.date or datetime.utcnow()
+            )
+            session.add(trade)
+            session.commit()
+            session.refresh(trade)
+            logger.info(f"Created new Trade ID {trade.id}")
+
+        # Update Trade state and status
+        trade.context_summary = analysis.context_summary or trade.context_summary
+        if trade.context_summary and len(trade.context_summary) > 300:
+            trade.context_summary = trade.context_summary[:300]
+        if analysis.trade_status_update == "CLOSED":
+            trade.status = "CLOSED"
+            trade.closed_at = db_message.date or datetime.utcnow()
+            logger.info(f"Trade ID {trade.id} status updated to CLOSED")
+        
+        session.commit()
+
+        # Save Actions and resolve Zerodha instrument details with target budget lot sizing
+        db_actions = process_trade_actions_and_sizing(
+            trade=trade,
+            db_message_id=db_message.id,
+            parsed_actions=analysis.actions
+        )
+        for db_action in db_actions:
+            session.add(db_action)
+        
+        session.commit()
+
+        # If trade is closed or exit action detected, generate square-off actions for any open legs
+        if trade and (analysis.trade_status_update == "CLOSED" or trade.status == "CLOSED" or any(a.action_type in ["EXIT", "CLOSE_LEG"] for a in analysis.actions)):
+            sq_actions = ensure_square_off_actions(session, trade, db_message, analysis.actions)
+            for sq_a in sq_actions:
+                if sq_a not in db_actions:
+                    db_actions.append(sq_a)
+
+        # Automatically execute pending orders if auto-placement flags are active
+        logger.info(f"Running automated order placement check for Trade ID {trade.id}...")
+        execute_trade_actions(session, trade.id, auto_mode=True)
+
+        # Send formatted message to actions channel
+        if actions_entity and db_actions:
+            try:
+                session.refresh(trade)
+                for a in db_actions:
+                    session.refresh(a)
+                    
+                html_msg = format_action_telegram_message_html(trade, db_actions)
+
+                # If any actionable orders remain PENDING, show "Place Order(s)" inline button
+                has_pending_orders = any(
+                    a.order_status == "PENDING" and a.action_type in ["BUY", "SELL", "EXIT", "CLOSE_LEG"]
+                    for a in db_actions
+                )
+
+                buttons = None
+                if has_pending_orders:
+                    buttons = [Button.inline("🚀 Place Order(s)", data=f"place_order:{trade.id}")]
+
+                await client.send_message(actions_entity, html_msg, parse_mode='html', buttons=buttons)
+                
+                # Mark actions as sent
+                for a in db_actions:
+                    a.telegram_sent = True
+                session.commit()
+                logger.info(f"Action notifications sent to Telegram for Trade ID {trade.id}")
+            except Exception as ae:
+                logger.error(f"Failed to send actions notification: {ae}")
+
+    db_message.analysed_by_ai = True
+    db_message.processed = True
+    db_message.processed_at = datetime.utcnow()
+    session.commit()
+    return True
 
 async def sync_and_process():
     """Main worker iteration to sync messages and run Gemini processing."""
@@ -631,116 +847,8 @@ async def sync_and_process():
         unanalysed_messages = session.query(Message).filter(Message.analysed_by_ai == False).order_by(Message.id.asc()).all()
         if unanalysed_messages:
             logger.info(f"Found {len(unanalysed_messages)} unanalysed messages in DB. Processing...")
-            
             for db_message in unanalysed_messages:
-                if is_poke_message(db_message.text):
-                    logger.info(f"Message ID {db_message.id} is a poke message ('{db_message.text.strip()}'). Skipping processing.")
-                    db_message.analysed_by_ai = True
-                    db_message.processed = True
-                    db_message.processed_at = datetime.utcnow()
-                    session.commit()
-                    continue
-
-                logger.info(f"Analyzing message ID {db_message.id} (TG ID: {db_message.telegram_message_id or 'N/A'})...")
-                
-                # Fetch open trades context and send to Gemini
-                open_trades = get_open_trades_context(session)
-                analysis = analyze_message_with_ai(db_message.text, open_trades)
-
-                if analysis:
-                    db_message.ai_response = json.dumps(analysis.model_dump(), default=str)
-                    
-                    if analysis.is_valid_trade_msg:
-                        logger.info(f"Valid trade detected by AI for message ID {db_message.id}.")
-                        
-                        trade = None
-                        # Is it a continuation? Try to find existing open trade
-                        if analysis.is_continuation and analysis.related_open_trade_id:
-                            trade = session.query(Trade).filter(Trade.id == analysis.related_open_trade_id).first()
-                            if trade:
-                                logger.info(f"Mapping message ID {db_message.id} to existing Trade ID {trade.id}")
-                        
-                        # Create new trade if not a continuation or parent trade not found
-                        if not trade:
-                            trade = Trade(
-                                status="OPEN",
-                                structure_type=analysis.structure_type,
-                                underlying=clean_symbol(analysis.underlying),
-                                opened_at=db_message.date or datetime.utcnow()
-                            )
-                            session.add(trade)
-                            session.commit()
-                            session.refresh(trade)
-                            logger.info(f"Created new Trade ID {trade.id}")
-
-                        # Update Trade state and status
-                        trade.context_summary = analysis.context_summary or trade.context_summary
-                        if trade.context_summary and len(trade.context_summary) > 300:
-                            trade.context_summary = trade.context_summary[:300]
-                        if analysis.trade_status_update == "CLOSED":
-                            trade.status = "CLOSED"
-                            trade.closed_at = db_message.date or datetime.utcnow()
-                            logger.info(f"Trade ID {trade.id} status updated to CLOSED")
-                        
-                        session.commit()
-
-                        # Save Actions and resolve Zerodha instrument details with target budget lot sizing
-                        db_actions = process_trade_actions_and_sizing(
-                            trade=trade,
-                            db_message_id=db_message.id,
-                            parsed_actions=analysis.actions
-                        )
-                        for db_action in db_actions:
-                            session.add(db_action)
-                        
-                        session.commit()
-
-                        # If trade is closed or exit action detected, generate square-off actions for any open legs
-                        if trade and (analysis.trade_status_update == "CLOSED" or trade.status == "CLOSED" or any(a.action_type in ["EXIT", "CLOSE_LEG"] for a in analysis.actions)):
-                            sq_actions = ensure_square_off_actions(session, trade, db_message, analysis.actions)
-                            for sq_a in sq_actions:
-                                if sq_a not in db_actions:
-                                    db_actions.append(sq_a)
-
-                        # Automatically execute pending orders if auto-placement flags are active
-                        logger.info(f"Running automated order placement check for Trade ID {trade.id}...")
-                        execute_trade_actions(session, trade.id, auto_mode=True)
-
-                        # Send formatted message to actions channel
-                        if actions_entity and db_actions:
-                            try:
-                                session.refresh(trade)
-                                for a in db_actions:
-                                    session.refresh(a)
-                                    
-                                html_msg = format_action_telegram_message_html(trade, db_actions)
-
-                                # If any actionable orders remain PENDING, show "Place Order(s)" inline button
-                                has_pending_orders = any(
-                                    a.order_status == "PENDING" and a.action_type in ["BUY", "SELL", "EXIT", "CLOSE_LEG"]
-                                    for a in db_actions
-                                )
-
-                                buttons = None
-                                if has_pending_orders:
-                                    buttons = [Button.inline("🚀 Place Order(s)", data=f"place_order:{trade.id}")]
-
-                                await client.send_message(actions_entity, html_msg, parse_mode='html', buttons=buttons)
-                                
-                                # Mark actions as sent
-                                for a in db_actions:
-                                    a.telegram_sent = True
-                                session.commit()
-                                logger.info(f"Action notifications sent to Telegram for Trade ID {trade.id}")
-                            except Exception as ae:
-                                logger.error(f"Failed to send actions notification: {ae}")
-
-                    db_message.analysed_by_ai = True
-                    db_message.processed = True
-                    db_message.processed_at = datetime.utcnow()
-                    session.commit()
-                else:
-                    logger.error(f"Failed to analyze message ID {db_message.id} with AI. Skipping and keeping it unanalysed for retry.")
+                await process_single_message(session, db_message, actions_entity)
 
     except Exception as e:
         logger.exception(f"Error in sync_and_process loop: {e}")
