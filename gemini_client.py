@@ -32,6 +32,22 @@ def clean_symbol(symbol: Optional[str]) -> Optional[str]:
         return match.group(0)
     return s[:20]
 
+def is_poke_message(text: Optional[str]) -> bool:
+    """
+    Checks if a message in source is simply a '.' or 'trade incoming' (case insensitive),
+    which is used to poke/ping users and not an actual trade recommendation.
+    """
+    if not text:
+        return False
+    cleaned = text.strip().strip('\u200b\ufeff\u200e\u200f').lower()
+    # Matches single or multiple dots (e.g. '.', '..', '...')
+    if re.fullmatch(r'\.+', cleaned):
+        return True
+    # Matches 'trade incoming', 'trade incoming.', 'trade incoming!', etc.
+    if re.fullmatch(r'trade\s+incoming[\.!\s]*', cleaned):
+        return True
+    return False
+
 # Define structured schema
 class ActionSchema(BaseModel):
     action_type: str = Field(description="Must be one of: BUY, SELL, EXIT, UPDATE_SL, CLOSE_LEG, INFO")
@@ -114,12 +130,21 @@ CRITICAL CONSTRAINTS:
    - Set `is_valid_trade_msg = True`, `is_continuation = True`, `related_open_trade_id` to the matching trade from Open Trades Context, and `trade_status_update = 'CLOSED'`.
    - If specific exit prices are given for legs, extract `action_type = 'EXIT'` with `order_type = 'LIMIT'` and the `price`.
 6. Keep `context_summary` extremely concise (under 50 words).
+7. If the message is simply a poke/ping notification (e.g. '.', 'trade incoming', '...'), set `is_valid_trade_msg = False`.
 """
 
 def analyze_message_with_ai(message_text: str, open_trades: List[Dict[str, Any]]) -> Optional[TradeAnalysisSchema]:
     """
     Sends message_text and open_trades context to Gemini for parsing and mapping.
     """
+    if is_poke_message(message_text):
+        logger.info(f"Skipping poke message ('{message_text.strip()}'): not a trade recommendation.")
+        return TradeAnalysisSchema(
+            is_valid_trade_msg=False,
+            trade_status_update="OPEN",
+            context_summary="Poke message ignored"
+        )
+
     if not api_key:
         logger.error("Gemini API key is not configured.")
         return None

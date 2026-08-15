@@ -11,7 +11,7 @@ from telethon import events, Button
 import db
 from models import Message, Trade, Action
 from telegram_client import client, check_login, get_channel_entity
-from gemini_client import analyze_message_with_ai, clean_symbol
+from gemini_client import analyze_message_with_ai, clean_symbol, is_poke_message
 from instruments_manager import resolve_nfo_instrument, parse_price_value, calculate_lots_from_budget
 from zerodha_client import place_zerodha_order, check_existing_zerodha_order_or_position, get_nfo_ltp
 
@@ -588,6 +588,22 @@ async def sync_and_process():
             if not msg.text:
                 continue
 
+            if is_poke_message(msg.text):
+                logger.info(f"Skipping poke message ID {msg.id}: '{msg.text.strip()}' (poke notification, not a trade recommendation)")
+                # Store raw message as already processed to advance sync min_id without triggering trade analysis/actions
+                db_message = Message(
+                    telegram_message_id=msg.id,
+                    channel_id=str(source_channel_id),
+                    date=msg.date,
+                    text=msg.text,
+                    processed=True,
+                    analysed_by_ai=True,
+                    processed_at=datetime.utcnow()
+                )
+                session.add(db_message)
+                session.commit()
+                continue
+
             logger.info(f"Syncing new message ID {msg.id}: {msg.text[:50]}...")
 
             # 1. Store raw message in DB
@@ -617,6 +633,14 @@ async def sync_and_process():
             logger.info(f"Found {len(unanalysed_messages)} unanalysed messages in DB. Processing...")
             
             for db_message in unanalysed_messages:
+                if is_poke_message(db_message.text):
+                    logger.info(f"Message ID {db_message.id} is a poke message ('{db_message.text.strip()}'). Skipping processing.")
+                    db_message.analysed_by_ai = True
+                    db_message.processed = True
+                    db_message.processed_at = datetime.utcnow()
+                    session.commit()
+                    continue
+
                 logger.info(f"Analyzing message ID {db_message.id} (TG ID: {db_message.telegram_message_id or 'N/A'})...")
                 
                 # Fetch open trades context and send to Gemini
