@@ -21,15 +21,26 @@ if api_key:
 else:
     logger.warning("GEMINI_API_KEY is not set in environment!")
 
+KNOWN_TICKERS = ["BANKNIFTY", "MIDCPNIFTY", "FINNIFTY", "NIFTY", "SENSEX", "BANKEX", "VBL", "INDIGO", "TATASTEEL", "RELIANCE", "NATIONALUM"]
+
 def clean_symbol(symbol: Optional[str]) -> Optional[str]:
     """Cleans up AI-generated underlying symbol to a strict single uppercase ticker."""
     if not symbol:
         return None
     s = str(symbol).strip().upper()
-    # If symbol contains text like "TATASTEEL league/index..." or "NIFTY strategy...", extract first token
+    # Check known tickers first
+    for t in KNOWN_TICKERS:
+        if s.startswith(t):
+            return t
+    # Strip any trailing words, brackets, or suffixes
+    s = re.sub(r'[\s_\-\(\)].*$', '', s)
     match = re.search(r'^[A-Z0-9]+', s)
     if match:
-        return match.group(0)
+        clean = match.group(0)
+        for t in KNOWN_TICKERS:
+            if clean.startswith(t):
+                return t
+        return clean
     return s[:20]
 
 def is_poke_message(text: Optional[str]) -> bool:
@@ -51,8 +62,9 @@ def is_poke_message(text: Optional[str]) -> bool:
 # Define structured schema
 class ActionSchema(BaseModel):
     action_type: str = Field(description="Must be one of: BUY, SELL, EXIT, UPDATE_SL, CLOSE_LEG, INFO")
+    transaction_type: Optional[str] = Field(description="Zerodha order side: 'BUY' or 'SELL'. For entry: 'BUY' or 'SELL'. For EXIT: if exiting/closing a short position it is 'BUY'; if exiting/closing a long position it is 'SELL'.")
     is_main: Optional[bool] = Field(description="True if this is the primary/main directional leg of the trade, False if it is a hedge leg.")
-    underlying: Optional[str] = Field(description="Underlying index or stock symbol ONLY in uppercase, e.g. 'NIFTY', 'BANKNIFTY', 'VBL', 'INDIGO', 'RELIANCE', 'TATASTEEL'. Do NOT include any explanations or reasoning.")
+    underlying: Optional[str] = Field(description="Underlying index or stock symbol ONLY in uppercase, e.g. 'NIFTY', 'BANKNIFTY', 'VBL', 'INDIGO', 'RELIANCE', 'TATASTEEL'. Do NOT include any explanations, reasoning, or 'REF' suffixes.")
     option_type: Optional[str] = Field(description="Instrument option type: 'CE', 'PE', or 'FUT'")
     strike: Optional[float] = Field(description="Numeric strike price if option, e.g. 24000, 23600, 480, 5300, 192.5. Null for Futures.")
     expiry_info: Optional[str] = Field(description="Expiry date or month string if mentioned, e.g. '28JUL', 'AUG', '4AUG', '11AUG', 'JULY'. Null if default/nearest.")
@@ -60,7 +72,7 @@ class ActionSchema(BaseModel):
     product: Optional[str] = Field(description="Product code: 'NRML' for overnight/positional trades, 'MIS' if explicitly intraday.")
     lots: Optional[int] = Field(description="Number of lots to trade, default 1 unless specified (e.g. 2 lots, add 1 lot).")
     instrument_name: Optional[str] = Field(description="The exact copyable search query on Zerodha. Options syntax: '<UNDERLYING> <EXPIRY> <STRIKE> <PE/CE>' (e.g. 'NIFTY 28JUL2026 24000 PE' or 'VBL 480 CE'). Futures: '<UNDERLYING> FUT' (e.g. 'VBL FUT', 'NIFTY FUT').")
-    price: Optional[str] = Field(description="Execution price, entry range, or limit, e.g. '183' or '467-468' or '81' or '4.5-4.7'")
+    price: Optional[str] = Field(description="Execution price, entry range, or limit, e.g. '183' or '467-468' or '81' or '4.5-4.7' or '220s' or 'above 200'")
     stoploss: Optional[str] = Field(description="Stoploss value or trigger price, e.g. '220' or '475'")
     target: Optional[str] = Field(description="Target price, e.g. '453' or '3.9'")
     is_limit: Optional[bool] = Field(description="True if limit order specified, False if market/at-the-money or range not requiring a hard limit")
@@ -68,6 +80,8 @@ class ActionSchema(BaseModel):
 
     def __init__(self, **data):
         defaults = {
+            "action_type": "INFO",
+            "transaction_type": None,
             "is_main": True,
             "underlying": None,
             "option_type": None,
@@ -90,10 +104,10 @@ class ActionSchema(BaseModel):
 
 class TradeAnalysisSchema(BaseModel):
     is_valid_trade_msg: bool = Field(description="True if this message represents a valid trade setup, entry, modification, stoploss update, target update, or exit/close alert. False if it is general talk, FYI, or unrelated.")
-    is_continuation: bool = Field(description="True if this message updates or closes a trade from the provided 'Open Trades Context' (e.g. updates stoploss, closes a position, target hit).")
+    is_continuation: bool = Field(description="True if this message updates, adds lots to, or closes a trade from the provided 'Open Trades Context'.")
     related_open_trade_id: Optional[int] = Field(description="The 'id' of the related open trade from the provided 'Open Trades Context', if is_continuation is True.")
-    structure_type: Optional[str] = Field(description="The overall strategy structure, e.g., 'TATASTEEL BULL PUT SPREAD', 'NIFTY PE SPREAD', 'SINGLE CE BUY'.")
-    underlying: Optional[str] = Field(description="Underlying ticker symbol ONLY in uppercase, e.g. 'TATASTEEL', 'NIFTY', 'VBL', 'BANKNIFTY'. ABSOLUTELY NO reasoning or extra text.")
+    structure_type: Optional[str] = Field(description="The overall strategy structure, e.g., 'TATASTEEL BULL PUT SPREAD', 'NIFTY PE SPREAD', 'INDIGO BEAR CALL SPREAD', 'SINGLE CE BUY'.")
+    underlying: Optional[str] = Field(description="Underlying ticker symbol ONLY in uppercase, e.g. 'TATASTEEL', 'NIFTY', 'VBL', 'INDIGO', 'BANKNIFTY'. ABSOLUTELY NO reasoning, markdown, or 'REF' suffixes.")
     actions: List[ActionSchema] = Field(description="The list of orders or actions to execute for this trade message.")
     trade_status_update: str = Field(description="If this message closes or exits the entire trade, set this to 'CLOSED'. Otherwise, keep it 'OPEN'.")
     context_summary: Optional[str] = Field(description="A highly summarized, clear explanation (under 50 words) of the overall trade state after processing this message.")
@@ -119,18 +133,33 @@ SYSTEM_INSTRUCTION = """
 You are an expert Indian stock market trading system assistant. Your task is to process incoming messages from a trading Telegram channel and structure them into highly actionable trading data.
 
 CRITICAL CONSTRAINTS:
-1. `underlying` MUST be strictly a single uppercase ticker symbol string, e.g. "TATASTEEL", "NIFTY", "BANKNIFTY", "INDIGO", "VBL", "RELIANCE". NEVER include reasoning, markdown, code, or extra words in `underlying`.
-2. Extract ALL actionable order legs into the `actions` array. For spreads (e.g. Bull Put Spread, Bear Fut Spread), extract both Sell and Buy legs as separate ActionSchema items.
+1. `underlying` MUST be strictly a single uppercase ticker symbol string, e.g. "TATASTEEL", "NIFTY", "BANKNIFTY", "INDIGO", "VBL", "RELIANCE", "NATIONALUM". NEVER include reasoning, markdown, code, or fake suffixes like 'REF'.
+2. Trade Entry Messages:
+   - Any message providing new trade recommendations, stock/index option spreads, future spreads, or single legs is a VALID TRADE MESSAGE (`is_valid_trade_msg = True`).
+   - Extract ALL actionable order legs (e.g. Sell, Buy, Hedge/Buy, Deploy Call Spread, Deploy Put Spread) into the `actions` array.
+   - For spreads (e.g. Bull Put Spread, Bear Call Spread, Bear Fut Spread), extract both Sell and Buy legs as separate ActionSchema items.
+   - Set `transaction_type` on each leg: 'SELL' for sell legs, 'BUY' for buy/hedge legs.
 3. Classify `is_main` for each leg:
-   - For Future + Option spreads (e.g. Bear Fut Spread): the Futures leg is `is_main = True`, and the Option leg is `is_main = False` (hedge).
-   - For Option Credit Spreads (e.g. Bull Put Spread, Bear Call Spread): the SELL (short) leg is `is_main = True`, and the BUY (long) leg is `is_main = False` (hedge).
+   - For Future + Option spreads (e.g. Bear Fut Spread): Futures leg is `is_main = True`, Option leg is `is_main = False` (hedge).
+   - For Option Credit Spreads (e.g. Bull Put Spread, Bear Call Spread): SELL (short) leg is `is_main = True`, BUY (long) leg is `is_main = False` (hedge).
    - For single-leg trades: `is_main = True`.
-4. If a price range or limit price is specified (e.g. "@ Range (4.5-4.7) Place limit orders", "Close 24600 at 93"), set `order_type = 'LIMIT'`, `is_limit = True`, and `price` to the price value or range.
-5. For trade exit/close alerts (e.g., "SL hit Exit full position", "Close full position", "Exit 24000 PE at 90"):
-   - Set `is_valid_trade_msg = True`, `is_continuation = True`, `related_open_trade_id` to the matching trade from Open Trades Context, and `trade_status_update = 'CLOSED'`.
-   - If specific exit prices are given for legs, extract `action_type = 'EXIT'` with `order_type = 'LIMIT'` and the `price`.
-6. Keep `context_summary` extremely concise (under 50 words).
-7. If the message is simply a poke/ping notification (e.g. '.', 'trade incoming', '...'), set `is_valid_trade_msg = False`.
+4. Order Types & Prices:
+   - If a price range, limit price, or level is specified (e.g. "@ Range (4.5-4.7)", "@ 98-110", "@ 220s", "above 200", "near 100", "Close 24600 at 93"), set `order_type = 'LIMIT'`, `is_limit = True`, and extract `price`.
+   - If no price is given or execution is CMP / Market / immediate, set `order_type = 'MARKET'`.
+5. Continuation, Leg Updates, Averaging, and Follow-ups:
+   - When a message provides specific strikes/legs for a previously announced strategy (e.g. after 'Deploy Bear Call Spread' followed by 'Sell 23950 CE Buy 24250 CE'), set `is_valid_trade_msg = True`, `is_continuation = True`, and `related_open_trade_id` to that open trade.
+   - When a message instructs averaging/adding a lot (e.g. 'We will sell 24050 PE at 520-550', 'add that lot in 220s'), set `is_valid_trade_msg = True`, `is_continuation = True`, and `related_open_trade_id` to the matching open trade.
+   - When a message updates target or stoploss for an existing leg, set `is_valid_trade_msg = True`, `is_continuation = True`, and `related_open_trade_id` to the matching open trade.
+6. Trade Exits and Profit Booking:
+   - When an alert instructs to close/exit or book profit (e.g. "SL hit Exit full position", "Close full position", "Close future position at ... All call at ... We are closing the trade", "PROFIT BOOKING IN THIS TRADE Close [strike] Sell leg Close [strike] Hedge leg", "Exit 24000 PE at 90", "Book 24150 PE at 35-36"):
+     - Set `is_valid_trade_msg = True`, `is_continuation = True`, and `related_open_trade_id` to the matching open trade from Open Trades Context.
+     - Set `trade_status_update = 'CLOSED'`.
+     - Extract `action_type = 'EXIT'` for each leg.
+     - For `transaction_type` on EXIT actions:
+       - If closing a short/sold leg -> `transaction_type = 'BUY'`
+       - If closing a long/bought leg -> `transaction_type = 'SELL'`
+7. Non-Trade Messages:
+   - General market discussion, disclaimer notices, motivational chats, or poke/ping notifications (e.g. '.', 'trade incoming', '...') that contain NO actionable entry/exit/SL instructions should set `is_valid_trade_msg = False`.
 """
 
 def analyze_message_with_ai(message_text: str, open_trades: List[Dict[str, Any]]) -> Optional[TradeAnalysisSchema]:
@@ -169,7 +198,10 @@ Open Trades Context (Currently active open positions):
 {context_str}
 \"\"\"
 
-Please analyze the message above against the active open trades and return a highly structured response.
+INSTRUCTIONS:
+1. NEW TRADE: If this message introduces a NEW trade (even if other trades are open in context), set `is_valid_trade_msg = True`, `is_continuation = False`, `related_open_trade_id = None`, extract `underlying`, `structure_type`, and ALL entry legs (including legs with emojis like 🔴Sell, 🟢Buy, 🟢Hedge/Buy) into `actions`.
+2. OPEN TRADE UPDATE / EXIT: If this message relates to, modifies, or closes an open trade (including profit booking alerts like CLOSE [strike] Sell leg, Close [strike] Hedge leg, or Exit full position), set `is_valid_trade_msg = True`, `is_continuation = True`, `trade_status_update = CLOSED`, `related_open_trade_id` to that trade ID, and extract exit actions for all mentioned legs.
+3. NON-TRADE: If purely general chat, motivation, or disclaimer with no trade action, set `is_valid_trade_msg = False`.
 """
 
         # Generate content with structured JSON schema
@@ -182,8 +214,40 @@ Please analyze the message above against the active open trades and return a hig
             )
         )
 
+        # Check candidates response
+        if not response.candidates:
+            logger.warning("Gemini returned no candidates.")
+            return None
+
+        cand = response.candidates[0]
+        raw_text = None
+        if hasattr(cand, "content") and hasattr(cand.content, "parts") and cand.content.parts:
+            raw_text = cand.content.parts[0].text
+        elif hasattr(response, "text"):
+            try:
+                raw_text = response.text
+            except Exception:
+                raw_text = None
+
+        if not raw_text:
+            logger.warning(f"Gemini returned empty text or finish_reason: {getattr(cand, 'finish_reason', 'N/A')}")
+            return None
+
+        # Clean markdown codeblocks if present
+        cleaned_text = raw_text.strip()
+        if cleaned_text.startswith("```"):
+            cleaned_text = re.sub(r'^```(?:json)?\s*', '', cleaned_text)
+            cleaned_text = re.sub(r'\s*```$', '', cleaned_text)
+
         # Parse the JSON response
-        result_json = json.loads(response.text)
+        try:
+            result_json = json.loads(cleaned_text, strict=False)
+        except Exception:
+            match = re.search(r'\{.*\}', cleaned_text, re.DOTALL)
+            if match:
+                result_json = json.loads(match.group(0), strict=False)
+            else:
+                raise
         
         # Populate safe defaults if Gemini omitted optional schema keys
         if "actions" not in result_json or result_json["actions"] is None:

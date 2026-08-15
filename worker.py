@@ -360,13 +360,30 @@ def process_trade_actions_and_sizing(
         o_type = item["option_type"]
 
         # Resolve transaction type
-        trans_type = "BUY"
-        if action_type == "SELL":
-            trans_type = "SELL"
-        elif action_type == "BUY":
-            trans_type = "BUY"
-        elif action_type in ["EXIT", "CLOSE_LEG"]:
-            trans_type = "BUY" if o_type == "PE" or "SELL" in (getattr(schema, "details", None) or "").upper() else "SELL"
+        trans_type = getattr(schema, "transaction_type", None)
+        if not trans_type or trans_type not in ["BUY", "SELL"]:
+            if action_type == "SELL":
+                trans_type = "SELL"
+            elif action_type == "BUY":
+                trans_type = "BUY"
+            elif action_type in ["EXIT", "CLOSE_LEG"]:
+                # Check if there is an existing leg in trade.actions to invert
+                matching_entry = None
+                if trade and getattr(trade, "actions", None):
+                    for pa in trade.actions:
+                        if pa.action_type in ["BUY", "SELL"]:
+                            if (inst and pa.tradingsymbol == inst.get("tradingsymbol")) or \
+                               (strike_val and pa.strike and abs(pa.strike - strike_val) < 0.01):
+                                matching_entry = pa
+                                break
+                if matching_entry:
+                    trans_type = "BUY" if matching_entry.transaction_type == "SELL" else "SELL"
+                else:
+                    # In credit spreads / short fut spreads, main is short (exit BUY), hedge is long (exit SELL)
+                    if item["is_main"]:
+                        trans_type = "BUY"
+                    else:
+                        trans_type = "SELL"
 
         # Resolve order type
         ord_type = "LIMIT" if (getattr(schema, "order_type", None) == "LIMIT" or getattr(schema, "is_limit", False)) else "MARKET"
@@ -499,12 +516,12 @@ def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = Fal
 
         # Extract numerical price if limit order
         limit_price = None
-        if action.order_type == "LIMIT" and action.price:
-            try:
-                # Handle price ranges like '183' or '467-468' -> pick first number or average
-                clean_price = str(action.price).split("-")[0].strip()
-                limit_price = float(clean_price)
-            except Exception:
+        if action.order_type == "LIMIT":
+            if action.price:
+                limit_price = parse_price_value(action.price)
+            if limit_price is None or limit_price <= 0:
+                logger.info(f"Action ID {action.id} has LIMIT order_type but unparseable price '{action.price}'. Converting to MARKET order.")
+                action.order_type = "MARKET"
                 limit_price = None
 
         logger.info(f"Executing Zerodha order for Action ID {action.id}: {action.transaction_type} {action.quantity} x {action.tradingsymbol} ({action.order_type})")
@@ -884,11 +901,63 @@ async def process_single_message(session: Session, db_message: Message, actions_
             trade = session.query(Trade).filter(Trade.id == analysis.related_open_trade_id).first()
             if trade:
                 logger.info(f"Mapping message ID {db_message.id} to existing Trade ID {trade.id}")
-        
-        # Create new trade if not a continuation or parent trade not found
+
+        # Fallback matching: if AI did not provide continuation id but this is an exit/closure or leg update
+        if not trade:
+            u_clean = clean_symbol(analysis.underlying)
+            # 1. Try matching by underlying or prefix against open trades
+            if u_clean:
+                candidate_trade = session.query(Trade).filter(
+                    Trade.status == "OPEN",
+                    Trade.underlying == u_clean
+                ).order_by(Trade.id.desc()).first()
+                
+                # If exact match not found, check prefix match against open trades
+                if not candidate_trade:
+                    open_trades = session.query(Trade).filter(Trade.status == "OPEN").all()
+                    for ot in open_trades:
+                        if ot.underlying and (u_clean.startswith(ot.underlying) or ot.underlying.startswith(u_clean)):
+                            candidate_trade = ot
+                            break
+
+                if candidate_trade:
+                    has_new_structure = bool(analysis.structure_type and candidate_trade.structure_type and analysis.structure_type.upper() != candidate_trade.structure_type.upper() and not candidate_trade.structure_type.startswith(analysis.structure_type))
+                    if not has_new_structure or analysis.is_continuation or analysis.trade_status_update == "CLOSED" or any(a.action_type in ["EXIT", "CLOSE_LEG", "UPDATE_SL"] for a in analysis.actions) or not analysis.actions:
+                        trade = candidate_trade
+                        logger.info(f"Fallback mapped message ID {db_message.id} to open Trade ID {trade.id} ({candidate_trade.underlying})")
+
+            # 2. Try matching by strike against open trade actions
+            if not trade and analysis.actions:
+                msg_strikes = [getattr(a, "strike", None) for a in analysis.actions if getattr(a, "strike", None)]
+                if msg_strikes:
+                    open_trades_with_actions = session.query(Trade).filter(Trade.status == "OPEN").all()
+                    for ot in open_trades_with_actions:
+                        ot_strikes = [a.strike for a in ot.actions if a.strike]
+                        if any(s in ot_strikes for s in msg_strikes):
+                            trade = ot
+                            logger.info(f"Fallback mapped message ID {db_message.id} to open Trade ID {trade.id} via matching strike {msg_strikes}")
+                            break
+
+            # 3. If still not matched, and there is only 1 open trade, and message is an exit/closure
+            if not trade and (analysis.trade_status_update == "CLOSED" or any(a.action_type in ["EXIT", "CLOSE_LEG"] for a in analysis.actions)):
+                open_trades_list = session.query(Trade).filter(Trade.status == "OPEN").all()
+                if len(open_trades_list) == 1:
+                    trade = open_trades_list[0]
+                    logger.info(f"Fallback mapped message ID {db_message.id} to single open Trade ID {trade.id}")
+
+        # Check for explicit closing keywords in message text
+        msg_text_lower = (db_message.text or "").lower()
+        is_closing_phrase = any(w in msg_text_lower for w in [
+            "close the trade", "close full position", "closing the trade",
+            "sl hit", "exit the full position", "exit full position",
+            "profit booking in this trade", "close the entire position",
+            "close full", "exit full"
+        ])
+
+        # Create new trade only if not mapped to existing open trade
         if not trade:
             trade = Trade(
-                status="OPEN",
+                status="CLOSED" if (analysis.trade_status_update == "CLOSED" or is_closing_phrase) else "OPEN",
                 structure_type=analysis.structure_type,
                 underlying=clean_symbol(analysis.underlying),
                 opened_at=db_message.date or datetime.utcnow()
@@ -899,10 +968,15 @@ async def process_single_message(session: Session, db_message: Message, actions_
             logger.info(f"Created new Trade ID {trade.id}")
 
         # Update Trade state and status
+        if analysis.underlying and (not trade.underlying or "REF" in trade.underlying):
+            trade.underlying = clean_symbol(analysis.underlying)
+        if analysis.structure_type and not trade.structure_type:
+            trade.structure_type = analysis.structure_type
+
         trade.context_summary = analysis.context_summary or trade.context_summary
         if trade.context_summary and len(trade.context_summary) > 300:
             trade.context_summary = trade.context_summary[:300]
-        if analysis.trade_status_update == "CLOSED":
+        if analysis.trade_status_update == "CLOSED" or is_closing_phrase:
             trade.status = "CLOSED"
             trade.closed_at = db_message.date or datetime.utcnow()
             logger.info(f"Trade ID {trade.id} status updated to CLOSED")
