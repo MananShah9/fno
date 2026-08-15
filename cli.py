@@ -440,23 +440,28 @@ def manage_config_menu():
         print_header("MANAGE SYSTEM CONFIGURATION (.env)")
         cfg = config.load_config()
         
-        print(f"1. TELEGRAM_API_ID:       {cfg['TELEGRAM_API_ID'] or 'Not Configured'}")
-        print(f"2. TELEGRAM_API_HASH:     {cfg['TELEGRAM_API_HASH'] or 'Not Configured'}")
-        print(f"3. TELEGRAM_PHONE:        {cfg['TELEGRAM_PHONE'] or 'Not Configured'}")
-        print(f"4. TELEGRAM_SOURCE_CHAN:  {cfg['TELEGRAM_SOURCE_CHANNEL'] or 'Not Configured'}")
-        print(f"5. TELEGRAM_MIRROR_CHAN:  {cfg['TELEGRAM_MIRROR_CHANNEL'] or 'Not Configured'}")
-        print(f"6. TELEGRAM_ACTIONS_CHAN: {cfg['TELEGRAM_ACTIONS_CHANNEL'] or 'Not Configured'}")
-        print(f"7. TELEGRAM_REFRESH_INT:  {cfg['TELEGRAM_REFRESH_INTERVAL']} seconds")
-        print(f"8. GEMINI_API_KEY:        {'*' * 10 if cfg['GEMINI_API_KEY'] else 'Not Configured'}")
-        print(f"9. GEMINI_MODEL:          {cfg['GEMINI_MODEL']}")
-        print(f"10. AUTO_PLACE_ORDERS:     {cfg['AUTO_PLACE_ORDERS']}")
-        print(f"11. AUTO_PLACE_EXIT_ORDERS: {cfg['AUTO_PLACE_EXIT_ORDERS']}")
-        print(f"12. TARGET_INVESTMENT_BUDGET: Rs. {cfg.get('TARGET_INVESTMENT_BUDGET', '100000')}")
-        print(f"13. LOG_LEVEL:                {cfg.get('LOG_LEVEL', 'INFO')}")
-        print(f"14. 🔙 Return to Main Menu")
+        print(f"1. TELEGRAM_API_ID:          {cfg['TELEGRAM_API_ID'] or 'Not Configured'}")
+        print(f"2. TELEGRAM_API_HASH:        {cfg['TELEGRAM_API_HASH'] or 'Not Configured'}")
+        print(f"3. TELEGRAM_PHONE:           {cfg['TELEGRAM_PHONE'] or 'Not Configured'}")
+        print(f"4. TELEGRAM_SOURCE_CHAN:     {cfg['TELEGRAM_SOURCE_CHANNEL'] or 'Not Configured'}")
+        print(f"5. TELEGRAM_MIRROR_CHAN:     {cfg['TELEGRAM_MIRROR_CHANNEL'] or 'Not Configured'}")
+        print(f"6. TELEGRAM_ACTIONS_CHAN:    {cfg['TELEGRAM_ACTIONS_CHANNEL'] or 'Not Configured'}")
+        print(f"7. TELEGRAM_REFRESH_INT:     {cfg['TELEGRAM_REFRESH_INTERVAL']} seconds")
+        print(f"8. TELEGRAM_TIME_FILTER:     {cfg.get('TELEGRAM_TIME_FILTER_ENABLED', False)}")
+        print(f"9. TELEGRAM_START_TIME:      {cfg.get('TELEGRAM_START_TIME', '08:30')}")
+        print(f"10. TELEGRAM_END_TIME:       {cfg.get('TELEGRAM_END_TIME', '16:30')}")
+        print(f"11. TELEGRAM_WEEKDAYS_ONLY:  {cfg.get('TELEGRAM_WEEKDAYS_ONLY', True)}")
+        print(f"12. TELEGRAM_TIMEZONE:       {cfg.get('TELEGRAM_TIMEZONE', 'Asia/Kolkata')}")
+        print(f"13. GEMINI_API_KEY:          {'*' * 10 if cfg['GEMINI_API_KEY'] else 'Not Configured'}")
+        print(f"14. GEMINI_MODEL:            {cfg['GEMINI_MODEL']}")
+        print(f"15. AUTO_PLACE_ORDERS:        {cfg['AUTO_PLACE_ORDERS']}")
+        print(f"16. AUTO_PLACE_EXIT_ORDERS:   {cfg['AUTO_PLACE_EXIT_ORDERS']}")
+        print(f"17. TARGET_INVESTMENT_BUDGET: Rs. {cfg.get('TARGET_INVESTMENT_BUDGET', '100000')}")
+        print(f"18. LOG_LEVEL:               {cfg.get('LOG_LEVEL', 'INFO')}")
+        print(f"19. 🔙 Return to Main Menu")
         
-        choice = input("\nSelect setting to edit (1-14): ").strip()
-        if choice == '14':
+        choice = input("\nSelect setting to edit (1-19): ").strip()
+        if choice == '19':
             break
             
         env_map = {
@@ -467,12 +472,17 @@ def manage_config_menu():
             '5': 'TELEGRAM_MIRROR_CHANNEL',
             '6': 'TELEGRAM_ACTIONS_CHANNEL',
             '7': 'TELEGRAM_REFRESH_INTERVAL',
-            '8': 'GEMINI_API_KEY',
-            '9': 'GEMINI_MODEL',
-            '10': 'AUTO_PLACE_ORDERS',
-            '11': 'AUTO_PLACE_EXIT_ORDERS',
-            '12': 'TARGET_INVESTMENT_BUDGET',
-            '13': 'LOG_LEVEL'
+            '8': 'TELEGRAM_TIME_FILTER_ENABLED',
+            '9': 'TELEGRAM_START_TIME',
+            '10': 'TELEGRAM_END_TIME',
+            '11': 'TELEGRAM_WEEKDAYS_ONLY',
+            '12': 'TELEGRAM_TIMEZONE',
+            '13': 'GEMINI_API_KEY',
+            '14': 'GEMINI_MODEL',
+            '15': 'AUTO_PLACE_ORDERS',
+            '16': 'AUTO_PLACE_EXIT_ORDERS',
+            '17': 'TARGET_INVESTMENT_BUDGET',
+            '18': 'LOG_LEVEL'
         }
         
         if choice in env_map:

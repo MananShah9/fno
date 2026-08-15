@@ -15,6 +15,7 @@ from gemini_client import analyze_message_with_ai, clean_symbol, is_poke_message
 from instruments_manager import resolve_nfo_instrument, parse_price_value, calculate_lots_from_budget
 from zerodha_client import place_zerodha_order, check_existing_zerodha_order_or_position, get_nfo_ltp
 from stage_tracker import record_stage, StageContext, get_code_location
+from time_filter import is_telegram_time_active, get_schedule_description
 
 load_dotenv()
 
@@ -675,6 +676,12 @@ def setup_telegram_event_handlers():
             if not is_match:
                 return
 
+            # Check if message edit is within active Telegram schedule
+            is_active, sched_reason = is_telegram_time_active(msg.date or datetime.utcnow())
+            if not is_active:
+                logger.info(f"Message edit event for Message ID {msg.id} ignored: {sched_reason}")
+                return
+
             logger.info(f"✏️ Message edit detected for Message ID {msg.id} in source channel.")
 
             session = db.SessionLocal()
@@ -826,6 +833,26 @@ async def process_single_message(session: Session, db_message: Message, actions_
             session=session
         )
         return True
+
+    # Check if message timestamp falls within configured active schedule
+    if db_message.date:
+        is_active, sched_reason = is_telegram_time_active(db_message.date)
+        if not is_active:
+            logger.info(f"Message ID {db_message.id} (date: {db_message.date}) skipped by schedule filter: {sched_reason}")
+            record_stage(
+                stage="TIME_WINDOW_FILTER",
+                status="SKIPPED",
+                message_id=db_message.id,
+                telegram_message_id=db_message.telegram_message_id,
+                revision=rev,
+                details={"reason": sched_reason, "msg_date": str(db_message.date)},
+                session=session
+            )
+            db_message.analysed_by_ai = True
+            db_message.processed = True
+            db_message.processed_at = datetime.utcnow()
+            session.commit()
+            return True
 
     if is_poke_message(db_message.text):
         logger.info(f"Message ID {db_message.id} is a poke message ('{db_message.text.strip()}'). Skipping processing.")
@@ -1095,6 +1122,12 @@ async def process_single_message(session: Session, db_message: Message, actions_
 
 async def sync_and_process():
     """Main worker iteration to sync messages and run Gemini processing."""
+    # Check if currently within active Telegram schedule
+    is_active, sched_reason = is_telegram_time_active()
+    if not is_active:
+        logger.info(f"Sync skipped: {sched_reason}")
+        return
+
     source_channel_id = os.getenv("TELEGRAM_SOURCE_CHANNEL")
     mirror_channel_id = os.getenv("TELEGRAM_MIRROR_CHANNEL")
     actions_channel_id = os.getenv("TELEGRAM_ACTIONS_CHANNEL")
@@ -1134,6 +1167,36 @@ async def sync_and_process():
         # Fetch messages in chronological order (reverse=True)
         async for msg in client.iter_messages(source_entity, min_id=min_id, reverse=True):
             if not msg.text:
+                continue
+
+            # Check if message timestamp falls within active schedule
+            msg_active, msg_sched_reason = is_telegram_time_active(msg.date)
+            if not msg_active:
+                logger.info(f"Skipping message ID {msg.id} (sent at {msg.date}): {msg_sched_reason}")
+                # Store message as processed to advance sync min_id without triggering trade analysis/actions
+                db_message = Message(
+                    telegram_message_id=msg.id,
+                    channel_id=str(source_channel_id),
+                    date=msg.date,
+                    text=msg.text,
+                    processed=True,
+                    analysed_by_ai=True,
+                    processed_at=datetime.utcnow(),
+                    revision=0
+                )
+                session.add(db_message)
+                session.commit()
+                session.refresh(db_message)
+
+                record_stage(
+                    stage="TIME_WINDOW_FILTER",
+                    status="SKIPPED",
+                    message_id=db_message.id,
+                    telegram_message_id=msg.id,
+                    revision=0,
+                    details={"reason": msg_sched_reason, "msg_date": str(msg.date), "raw_text": msg.text[:80]},
+                    session=session
+                )
                 continue
 
             if is_poke_message(msg.text):
@@ -1237,10 +1300,23 @@ async def worker_loop():
     # Register Telegram CallbackQuery button listeners
     setup_telegram_event_handlers()
 
+    logger.info(f"Telegram active schedule: {get_schedule_description()}")
     logger.info("Starting background sync and processing loop...")
+    
+    last_inactive_log_time = 0.0
+
     while True:
         try:
-            await sync_and_process()
+            is_active, sched_reason = is_telegram_time_active()
+            if not is_active:
+                now_sec = asyncio.get_event_loop().time()
+                # Log once every 60 seconds when waiting outside active hours
+                if now_sec - last_inactive_log_time >= 60.0:
+                    logger.info(f"⏳ {sched_reason}. Pausing Telegram sync.")
+                    last_inactive_log_time = now_sec
+            else:
+                last_inactive_log_time = 0.0
+                await sync_and_process()
         except Exception as e:
             logger.error(f"Unhandled error in worker main loop: {e}")
         

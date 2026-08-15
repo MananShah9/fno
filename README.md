@@ -49,6 +49,13 @@ TELEGRAM_ACTIONS_CHANNEL=@actions_chan_username
 # Telegram polling / refresh interval in seconds
 TELEGRAM_REFRESH_INTERVAL=10
 
+# Telegram Message Schedule & Active Time Filter
+TELEGRAM_TIME_FILTER_ENABLED=true
+TELEGRAM_START_TIME=08:30
+TELEGRAM_END_TIME=16:30
+TELEGRAM_WEEKDAYS_ONLY=true
+TELEGRAM_TIMEZONE=Asia/Kolkata
+
 # Gemini API Settings
 GEMINI_API_KEY=your_gemini_api_key
 GEMINI_MODEL=gemini-1.5-flash
