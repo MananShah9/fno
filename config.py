@@ -19,7 +19,7 @@ def load_config():
         "TELEGRAM_WEEKDAYS_ONLY": os.getenv("TELEGRAM_WEEKDAYS_ONLY", "true").lower() in ("true", "1", "t", "yes"),
         "TELEGRAM_TIMEZONE": os.getenv("TELEGRAM_TIMEZONE", "Asia/Kolkata"),
         "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY"),
-        "GEMINI_MODEL": os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
+        "GEMINI_MODEL": os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
         "DB_HOST": os.getenv("DB_HOST", "db"),
         "DB_PORT": os.getenv("DB_PORT", "5432"),
         "DB_USER": os.getenv("DB_USER", "postgres"),

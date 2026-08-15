@@ -3,7 +3,8 @@ import json
 import re
 import logging
 from typing import List, Dict, Any, Optional
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
@@ -14,11 +15,16 @@ logger = logging.getLogger(__name__)
 
 # Configure Gemini
 api_key = os.getenv("GEMINI_API_KEY")
-model_name = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-if api_key:
-    genai.configure(api_key=api_key)
-else:
+def get_genai_client() -> Optional[genai.Client]:
+    """Returns an initialized Google GenAI Client if API key is set."""
+    key = os.getenv("GEMINI_API_KEY")
+    if not key or key == "your_gemini_api_key":
+        return None
+    return genai.Client(api_key=key)
+
+if not api_key or api_key == "your_gemini_api_key":
     logger.warning("GEMINI_API_KEY is not set in environment!")
 
 KNOWN_TICKERS = ["BANKNIFTY", "MIDCPNIFTY", "FINNIFTY", "NIFTY", "SENSEX", "BANKEX", "VBL", "INDIGO", "TATASTEEL", "RELIANCE", "NATIONALUM"]
@@ -164,7 +170,7 @@ CRITICAL CONSTRAINTS:
 
 def analyze_message_with_ai(message_text: str, open_trades: List[Dict[str, Any]]) -> Optional[TradeAnalysisSchema]:
     """
-    Sends message_text and open_trades context to Gemini for parsing and mapping.
+    Sends message_text and open_trades context to Gemini for parsing and mapping using the google.genai SDK.
     """
     if is_poke_message(message_text):
         logger.info(f"Skipping poke message ('{message_text.strip()}'): not a trade recommendation.")
@@ -174,16 +180,14 @@ def analyze_message_with_ai(message_text: str, open_trades: List[Dict[str, Any]]
             context_summary="Poke message ignored"
         )
 
-    if not api_key:
+    client = get_genai_client()
+    if not client:
         logger.error("Gemini API key is not configured.")
         return None
 
-    try:
-        model = genai.GenerativeModel(
-            model_name=model_name,
-            system_instruction=SYSTEM_INSTRUCTION
-        )
+    current_model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
+    try:
         # Structure the context
         context_str = json.dumps(open_trades, indent=2, default=str)
         
@@ -205,13 +209,18 @@ INSTRUCTIONS:
 """
 
         # Generate content with structured JSON schema
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.types.GenerationConfig(
-                response_mime_type="application/json",
-                response_schema=TradeAnalysisSchema,
-                temperature=0.1  # Low temperature for highly deterministic extraction
-            )
+        config = types.GenerateContentConfig(
+            system_instruction=SYSTEM_INSTRUCTION,
+            response_mime_type="application/json",
+            response_schema=TradeAnalysisSchema,
+            temperature=0.1,  # Low temperature for highly deterministic extraction
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
+        )
+
+        response = client.models.generate_content(
+            model=current_model,
+            contents=prompt,
+            config=config
         )
 
         # Check candidates response
@@ -220,34 +229,42 @@ INSTRUCTIONS:
             return None
 
         cand = response.candidates[0]
-        raw_text = None
-        if hasattr(cand, "content") and hasattr(cand.content, "parts") and cand.content.parts:
-            raw_text = cand.content.parts[0].text
-        elif hasattr(response, "text"):
-            try:
+        result_json = None
+
+        if hasattr(response, "parsed") and response.parsed is not None:
+            if isinstance(response.parsed, TradeAnalysisSchema):
+                result_json = response.parsed.model_dump() if hasattr(response.parsed, "model_dump") else response.parsed.dict()
+            elif isinstance(response.parsed, dict):
+                result_json = response.parsed
+            elif hasattr(response.parsed, "__dict__"):
+                result_json = vars(response.parsed)
+
+        if result_json is None:
+            raw_text = None
+            if hasattr(response, "text") and response.text:
                 raw_text = response.text
+            elif hasattr(cand, "content") and hasattr(cand.content, "parts") and cand.content.parts:
+                raw_text = cand.content.parts[0].text
+
+            if not raw_text:
+                logger.warning(f"Gemini returned empty text or finish_reason: {getattr(cand, 'finish_reason', 'N/A')}")
+                return None
+
+            # Clean markdown codeblocks if present
+            cleaned_text = raw_text.strip()
+            if cleaned_text.startswith("```"):
+                cleaned_text = re.sub(r'^```(?:json)?\s*', '', cleaned_text)
+                cleaned_text = re.sub(r'\s*```$', '', cleaned_text)
+
+            # Parse the JSON response
+            try:
+                result_json = json.loads(cleaned_text, strict=False)
             except Exception:
-                raw_text = None
-
-        if not raw_text:
-            logger.warning(f"Gemini returned empty text or finish_reason: {getattr(cand, 'finish_reason', 'N/A')}")
-            return None
-
-        # Clean markdown codeblocks if present
-        cleaned_text = raw_text.strip()
-        if cleaned_text.startswith("```"):
-            cleaned_text = re.sub(r'^```(?:json)?\s*', '', cleaned_text)
-            cleaned_text = re.sub(r'\s*```$', '', cleaned_text)
-
-        # Parse the JSON response
-        try:
-            result_json = json.loads(cleaned_text, strict=False)
-        except Exception:
-            match = re.search(r'\{.*\}', cleaned_text, re.DOTALL)
-            if match:
-                result_json = json.loads(match.group(0), strict=False)
-            else:
-                raise
+                match = re.search(r'\{.*\}', cleaned_text, re.DOTALL)
+                if match:
+                    result_json = json.loads(match.group(0), strict=False)
+                else:
+                    raise
         
         # Populate safe defaults if Gemini omitted optional schema keys
         if "actions" not in result_json or result_json["actions"] is None:

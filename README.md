@@ -7,7 +7,7 @@ An intelligent, AI-powered futures and options trading system that monitors Tele
 ## 🚀 Key Features
 
 *   **Telegram Message Syncing:** Real-time progressive syncing of messages from designated F&O signal channels using Telethon.
-*   **AI-Powered Signal Extraction:** Integrates Google's Gemini LLM (`gemini-1.5-flash`) to parse raw, messy option signal messages into highly structured JSON formats (underlying ticker, entry/exit type, strike, premium, stop-loss, and target).
+*   **AI-Powered Signal Extraction:** Integrates Google's Gemini LLM (`gemini-2.5-flash` / `gemini-flash-latest`) to parse raw, messy option signal messages into highly structured JSON formats (underlying ticker, entry/exit type, strike, premium, stop-loss, and target).
 *   **Trade Lifecycle Management:** Dynamically links updates (e.g. stop-loss updates, leg closures, full exits) back to original open parent trades.
 *   **Structured Broadcasts:** Generates beautifully formatted HTML messages with click-to-copy (monospace) trade actions.
 *   **Interactive CLI:** A terminal dashboard to manage configurations, run initial auth setup, and monitor messages, trades, and order execution logs.
@@ -58,7 +58,7 @@ TELEGRAM_TIMEZONE=Asia/Kolkata
 
 # Gemini API Settings
 GEMINI_API_KEY=your_gemini_api_key
-GEMINI_MODEL=gemini-1.5-flash
+GEMINI_MODEL=gemini-2.5-flash
 
 # Database Settings
 DB_HOST=db
