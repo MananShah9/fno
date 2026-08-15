@@ -12,6 +12,7 @@ def load_config():
         "TELEGRAM_SOURCE_CHANNEL": os.getenv("TELEGRAM_SOURCE_CHANNEL"),
         "TELEGRAM_MIRROR_CHANNEL": os.getenv("TELEGRAM_MIRROR_CHANNEL"),
         "TELEGRAM_ACTIONS_CHANNEL": os.getenv("TELEGRAM_ACTIONS_CHANNEL"),
+        "TELEGRAM_REFRESH_INTERVAL": os.getenv("TELEGRAM_REFRESH_INTERVAL", "10"),
         "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY"),
         "GEMINI_MODEL": os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
         "DB_HOST": os.getenv("DB_HOST", "db"),
@@ -26,6 +27,7 @@ def load_config():
         "ZERODHA_EXTERNAL_2FA_TOTP": os.getenv("ZERODHA_EXTERNAL_2FA_TOTP"),
         "ZERODHA_PROXY_URL": os.getenv("ZERODHA_PROXY_URL", "http://100.125.89.97:8888"),
         "AUTO_PLACE_ORDERS": os.getenv("AUTO_PLACE_ORDERS", "false").lower() in ("true", "1", "t", "yes"),
+        "AUTO_PLACE_EXIT_ORDERS": os.getenv("AUTO_PLACE_EXIT_ORDERS", "false").lower() in ("true", "1", "t", "yes"),
     }
 
 def update_env_variable(key: str, value: str):

@@ -203,12 +203,15 @@ def manage_config_menu():
         print(f"4. TELEGRAM_SOURCE_CHAN:  {cfg['TELEGRAM_SOURCE_CHANNEL'] or 'Not Configured'}")
         print(f"5. TELEGRAM_MIRROR_CHAN:  {cfg['TELEGRAM_MIRROR_CHANNEL'] or 'Not Configured'}")
         print(f"6. TELEGRAM_ACTIONS_CHAN: {cfg['TELEGRAM_ACTIONS_CHANNEL'] or 'Not Configured'}")
-        print(f"7. GEMINI_API_KEY:        {'*' * 10 if cfg['GEMINI_API_KEY'] else 'Not Configured'}")
-        print(f"8. GEMINI_MODEL:          {cfg['GEMINI_MODEL']}")
-        print(f"9. 🔙 Return to Main Menu")
+        print(f"7. TELEGRAM_REFRESH_INT:  {cfg['TELEGRAM_REFRESH_INTERVAL']} seconds")
+        print(f"8. GEMINI_API_KEY:        {'*' * 10 if cfg['GEMINI_API_KEY'] else 'Not Configured'}")
+        print(f"9. GEMINI_MODEL:          {cfg['GEMINI_MODEL']}")
+        print(f"10. AUTO_PLACE_ORDERS:     {cfg['AUTO_PLACE_ORDERS']}")
+        print(f"11. AUTO_PLACE_EXIT_ORDERS: {cfg['AUTO_PLACE_EXIT_ORDERS']}")
+        print(f"12. 🔙 Return to Main Menu")
         
-        choice = input("\nSelect setting to edit (1-9): ").strip()
-        if choice == '9':
+        choice = input("\nSelect setting to edit (1-12): ").strip()
+        if choice == '12':
             break
             
         env_map = {
@@ -218,8 +221,11 @@ def manage_config_menu():
             '4': 'TELEGRAM_SOURCE_CHANNEL',
             '5': 'TELEGRAM_MIRROR_CHANNEL',
             '6': 'TELEGRAM_ACTIONS_CHANNEL',
-            '7': 'GEMINI_API_KEY',
-            '8': 'GEMINI_MODEL'
+            '7': 'TELEGRAM_REFRESH_INTERVAL',
+            '8': 'GEMINI_API_KEY',
+            '9': 'GEMINI_MODEL',
+            '10': 'AUTO_PLACE_ORDERS',
+            '11': 'AUTO_PLACE_EXIT_ORDERS'
         }
         
         if choice in env_map:

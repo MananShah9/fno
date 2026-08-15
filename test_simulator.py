@@ -7,7 +7,8 @@ from dotenv import load_dotenv
 
 import db
 from models import Message, Trade, Action
-from gemini_client import analyze_message_with_ai
+from gemini_client import analyze_message_with_ai, clean_symbol
+from instruments_manager import resolve_nfo_instrument
 from worker import get_open_trades_context, format_action_telegram_message_html
 
 load_dotenv()
@@ -123,9 +124,25 @@ async def run_simulation():
                 print(f"[+] Trade ID #{trade.id} is now CLOSED.")
             session.commit()
             
-            # Create Actions
+            # Create Actions and resolve NFO instruments
             db_actions = []
             for action_schema in analysis.actions:
+                u_symbol = clean_symbol(action_schema.underlying or analysis.underlying or trade.underlying)
+                o_type = action_schema.option_type or "CE"
+                inst = resolve_nfo_instrument(u_symbol, action_schema.strike, o_type, action_schema.expiry_info)
+                lots_count = action_schema.lots or 1
+                qty = (lots_count * inst["lot_size"]) if inst else None
+
+                trans_type = "BUY"
+                if action_schema.action_type == "SELL":
+                    trans_type = "SELL"
+                elif action_schema.action_type == "BUY":
+                    trans_type = "BUY"
+                elif action_schema.action_type in ["EXIT", "CLOSE_LEG"]:
+                    trans_type = "BUY" if o_type == "PE" else "SELL"
+
+                ord_type = "LIMIT" if (action_schema.order_type == "LIMIT" or action_schema.is_limit) else "MARKET"
+
                 db_action = Action(
                     trade_id=trade.id,
                     message_id=msg_obj.id,
@@ -136,11 +153,37 @@ async def run_simulation():
                     target=action_schema.target,
                     is_limit=action_schema.is_limit,
                     details=action_schema.details,
-                    telegram_sent=True  # Simulated
+                    telegram_sent=True,
+                    underlying=u_symbol,
+                    option_type=o_type,
+                    strike=action_schema.strike,
+                    expiry=inst["expiry"] if inst else action_schema.expiry_info,
+                    lots=lots_count,
+                    quantity=qty,
+                    tradingsymbol=inst["tradingsymbol"] if inst else None,
+                    instrument_token=inst["instrument_token"] if inst else None,
+                    transaction_type=trans_type,
+                    order_type=ord_type,
+                    product=action_schema.product or "NRML",
+                    order_status="PENDING"
                 )
                 session.add(db_action)
                 db_actions.append(db_action)
             session.commit()
+
+            # Automatic Square-Off Generation for closed trades / exits
+            if trade and (analysis.trade_status_update == "CLOSED" or trade.status == "CLOSED" or any(a.action_type in ["EXIT", "CLOSE_LEG"] for a in analysis.actions)):
+                from worker import ensure_square_off_actions
+                sq_actions = ensure_square_off_actions(session, trade, msg_obj, analysis.actions)
+                for sq_a in sq_actions:
+                    if sq_a not in db_actions:
+                        db_actions.append(sq_a)
+
+            # Test Order Execution & Deduplication
+            from worker import execute_trade_actions
+            exec_res = execute_trade_actions(session, trade.id)
+            if exec_res:
+                print(f"[*] Zerodha Execution Results: {json.dumps(exec_res, indent=2)}")
             
             # Refresh DB state for formatting
             session.refresh(trade)

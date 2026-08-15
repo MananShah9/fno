@@ -13,7 +13,7 @@ from models import Message, Trade, Action
 from telegram_client import client, check_login, get_channel_entity
 from gemini_client import analyze_message_with_ai, clean_symbol
 from instruments_manager import resolve_nfo_instrument
-from zerodha_client import place_zerodha_order
+from zerodha_client import place_zerodha_order, check_existing_zerodha_order_or_position
 
 load_dotenv()
 
@@ -135,10 +135,101 @@ def format_action_telegram_message_html(trade: Trade, actions: list) -> str:
         
     return "\n".join(msg_parts)
 
-def execute_trade_actions(session: Session, trade_id: int) -> list:
+def ensure_square_off_actions(session: Session, trade: Trade, db_message: Message, parsed_actions: list = None) -> list:
     """
-    Executes Zerodha orders for pending actionable legs of a given trade.
+    Scans a trade's open entry legs and creates reverse square-off Action records
+    if the trade is being closed or exited, avoiding duplicate square-offs.
     """
+    # Find all prior entry legs for this trade that have a resolved tradingsymbol
+    entry_actions = session.query(Action).filter(
+        Action.trade_id == trade.id,
+        Action.action_type.in_(["BUY", "SELL"]),
+        Action.tradingsymbol != None
+    ).order_by(Action.id.asc()).all()
+
+    if not entry_actions:
+        return []
+
+    # Find already existing exit actions for this trade
+    existing_exit_actions = session.query(Action).filter(
+        Action.trade_id == trade.id,
+        Action.action_type.in_(["EXIT", "CLOSE_LEG"])
+    ).all()
+    already_exited_symbols = {a.tradingsymbol for a in existing_exit_actions if a.tradingsymbol}
+
+    parsed_actions = parsed_actions or []
+    new_square_off_actions = []
+
+    for entry_act in entry_actions:
+        if entry_act.tradingsymbol in already_exited_symbols:
+            logger.info(f"Leg {entry_act.tradingsymbol} already has a square-off action. Skipping.")
+            continue
+
+        # Determine reverse transaction type: SELL -> BUY, BUY -> SELL
+        original_tt = (entry_act.transaction_type or entry_act.action_type).upper()
+        reverse_tt = "BUY" if original_tt == "SELL" else "SELL"
+
+        # Check if AI parsed explicit price or order_type for this leg in parsed_actions
+        matching_parsed = None
+        for pa in parsed_actions:
+            pa_sym = clean_symbol(getattr(pa, "underlying", None) or getattr(pa, "instrument_name", None))
+            pa_strike = getattr(pa, "strike", None)
+            if (entry_act.strike and pa_strike and abs(entry_act.strike - pa_strike) < 0.01) or \
+               (entry_act.tradingsymbol and pa_sym and pa_sym in entry_act.tradingsymbol):
+                matching_parsed = pa
+                break
+
+        # Determine order type and price: LIMIT if explicit price specified, MARKET otherwise
+        if matching_parsed and (matching_parsed.price or matching_parsed.order_type == "LIMIT" or matching_parsed.is_limit):
+            ord_type = "LIMIT"
+            is_lim = True
+            limit_price = matching_parsed.price
+        else:
+            ord_type = "MARKET"
+            is_lim = False
+            limit_price = matching_parsed.price if matching_parsed else None
+
+        square_off_action = Action(
+            trade_id=trade.id,
+            message_id=db_message.id,
+            action_type="EXIT",
+            instrument_name=entry_act.instrument_name,
+            price=limit_price,
+            stoploss=None,
+            target=None,
+            is_limit=is_lim,
+            details=f"Square-off exit leg for {entry_act.tradingsymbol}",
+            telegram_sent=False,
+            underlying=entry_act.underlying,
+            option_type=entry_act.option_type,
+            strike=entry_act.strike,
+            expiry=entry_act.expiry,
+            lots=entry_act.lots,
+            quantity=entry_act.quantity,
+            tradingsymbol=entry_act.tradingsymbol,
+            instrument_token=entry_act.instrument_token,
+            transaction_type=reverse_tt,
+            order_type=ord_type,
+            product=entry_act.product or "NRML",
+            order_status="PENDING"
+        )
+        session.add(square_off_action)
+        new_square_off_actions.append(square_off_action)
+        already_exited_symbols.add(entry_act.tradingsymbol)
+        logger.info(f"Generated square-off action for Trade #{trade.id}: {reverse_tt} {entry_act.quantity} x {entry_act.tradingsymbol} ({ord_type})")
+
+    session.commit()
+    return new_square_off_actions
+
+
+def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = False) -> list:
+    """
+    Executes Zerodha orders for pending actionable legs of a given trade with deduplication checks.
+    If auto_mode is True, checks AUTO_PLACE_ORDERS for entry actions and AUTO_PLACE_EXIT_ORDERS for exit actions.
+    """
+    auto_entry = os.getenv("AUTO_PLACE_ORDERS", "false").lower() in ("true", "1", "t", "yes")
+    auto_exit = os.getenv("AUTO_PLACE_EXIT_ORDERS", "false").lower() in ("true", "1", "t", "yes")
+
     actions = session.query(Action).filter(
         Action.trade_id == trade_id,
         Action.order_status.in_(["PENDING", "FAILED"]),
@@ -151,6 +242,42 @@ def execute_trade_actions(session: Session, trade_id: int) -> list:
             logger.warning(f"Action ID {action.id} missing tradingsymbol or quantity. Skipping order placement.")
             continue
 
+        is_exit = action.action_type in ["EXIT", "CLOSE_LEG"]
+
+        # If in automated background mode, check feature flags
+        if auto_mode:
+            if is_exit and not auto_exit:
+                logger.info(f"Skipping auto-placement for Exit Action ID {action.id} (AUTO_PLACE_EXIT_ORDERS is false).")
+                continue
+            elif not is_exit and not auto_entry:
+                logger.info(f"Skipping auto-placement for Entry Action ID {action.id} (AUTO_PLACE_ORDERS is false).")
+                continue
+
+        # 1. Deduplication check against existing Zerodha orders & positions
+        dedup_check = check_existing_zerodha_order_or_position(
+            tradingsymbol=action.tradingsymbol,
+            transaction_type=action.transaction_type or ("BUY" if action.action_type == "BUY" else "SELL"),
+            quantity=action.quantity,
+            is_exit=is_exit
+        )
+
+        if dedup_check["duplicate"]:
+            logger.info(f"Action ID {action.id} skipped via Zerodha deduplication: {dedup_check['message']}")
+            action.order_status = "PLACED" if dedup_check["reason"] != "position_already_closed" else "EXECUTED"
+            action.zerodha_response = f"Deduplicated: {dedup_check['message']}"
+            if dedup_check.get("order_id"):
+                action.zerodha_order_id = dedup_check["order_id"]
+            session.commit()
+
+            results.append({
+                "action_id": action.id,
+                "tradingsymbol": action.tradingsymbol,
+                "success": True,
+                "order_id": action.zerodha_order_id or "DEDUPLICATED",
+                "message": dedup_check["message"]
+            })
+            continue
+
         # Extract numerical price if limit order
         limit_price = None
         if action.order_type == "LIMIT" and action.price:
@@ -161,7 +288,7 @@ def execute_trade_actions(session: Session, trade_id: int) -> list:
             except Exception:
                 limit_price = None
 
-        logger.info(f"Executing Zerodha order for Action ID {action.id}: {action.transaction_type} {action.quantity} x {action.tradingsymbol}")
+        logger.info(f"Executing Zerodha order for Action ID {action.id}: {action.transaction_type} {action.quantity} x {action.tradingsymbol} ({action.order_type})")
 
         res = place_zerodha_order(
             tradingsymbol=action.tradingsymbol,
@@ -411,10 +538,16 @@ async def sync_and_process():
                         
                         session.commit()
 
-                        # Check AUTO_PLACE_ORDERS setting
-                        if AUTO_PLACE_ORDERS:
-                            logger.info(f"AUTO_PLACE_ORDERS is active. Automatically placing Zerodha orders for Trade ID {trade.id}...")
-                            execute_trade_actions(session, trade.id)
+                        # If trade is closed or exit action detected, generate square-off actions for any open legs
+                        if trade and (analysis.trade_status_update == "CLOSED" or trade.status == "CLOSED" or any(a.action_type in ["EXIT", "CLOSE_LEG"] for a in analysis.actions)):
+                            sq_actions = ensure_square_off_actions(session, trade, db_message, analysis.actions)
+                            for sq_a in sq_actions:
+                                if sq_a not in db_actions:
+                                    db_actions.append(sq_a)
+
+                        # Automatically execute pending orders if auto-placement flags are active
+                        logger.info(f"Running automated order placement check for Trade ID {trade.id}...")
+                        execute_trade_actions(session, trade.id, auto_mode=True)
 
                         # Send formatted message to actions channel
                         if actions_entity and db_actions:
@@ -425,14 +558,14 @@ async def sync_and_process():
                                     
                                 html_msg = format_action_telegram_message_html(trade, db_actions)
 
-                                # If AUTO_PLACE_ORDERS is false and there are pending actionable orders, show button
+                                # If any actionable orders remain PENDING, show "Place Order(s)" inline button
                                 has_pending_orders = any(
                                     a.order_status == "PENDING" and a.action_type in ["BUY", "SELL", "EXIT", "CLOSE_LEG"]
                                     for a in db_actions
                                 )
 
                                 buttons = None
-                                if not AUTO_PLACE_ORDERS and has_pending_orders:
+                                if has_pending_orders:
                                     buttons = [Button.inline("🚀 Place Order(s)", data=f"place_order:{trade.id}")]
 
                                 await client.send_message(actions_entity, html_msg, parse_mode='html', buttons=buttons)
@@ -472,4 +605,10 @@ async def worker_loop():
             await sync_and_process()
         except Exception as e:
             logger.error(f"Unhandled error in worker main loop: {e}")
-        await asyncio.sleep(10)  # Polling interval: 10 seconds
+        
+        try:
+            poll_interval = float(os.getenv("TELEGRAM_REFRESH_INTERVAL", "10"))
+        except (ValueError, TypeError):
+            poll_interval = 10.0
+            
+        await asyncio.sleep(poll_interval)

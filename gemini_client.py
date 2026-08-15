@@ -66,8 +66,11 @@ You are an expert Indian stock market trading system assistant. Your task is to 
 CRITICAL CONSTRAINTS:
 1. `underlying` MUST be strictly a single uppercase ticker symbol string, e.g. "TATASTEEL", "NIFTY", "BANKNIFTY", "INDIGO", "VBL", "RELIANCE". NEVER include reasoning, markdown, code, or extra words in `underlying`.
 2. Extract ALL actionable order legs into the `actions` array. For spreads (e.g. Bull Put Spread), extract both Sell and Buy legs as separate ActionSchema items.
-3. If a price range is specified (e.g. "@ Range (4.5-4.7) Place limit orders"), set `order_type = 'LIMIT'`, `is_limit = True`, and `price = '4.5-4.7'`.
-4. Keep `context_summary` extremely concise (under 50 words).
+3. If a price range or limit price is specified (e.g. "@ Range (4.5-4.7) Place limit orders", "Close 24600 at 93"), set `order_type = 'LIMIT'`, `is_limit = True`, and `price` to the price value or range.
+4. For trade exit/close alerts (e.g., "SL hit Exit full position", "Close full position", "Exit 24000 PE at 90"):
+   - Set `is_valid_trade_msg = True`, `is_continuation = True`, `related_open_trade_id` to the matching trade from Open Trades Context, and `trade_status_update = 'CLOSED'`.
+   - If specific exit prices are given for legs, extract `action_type = 'EXIT'` with `order_type = 'LIMIT'` and the `price`.
+5. Keep `context_summary` extremely concise (under 50 words).
 """
 
 def analyze_message_with_ai(message_text: str, open_trades: List[Dict[str, Any]]) -> Optional[TradeAnalysisSchema]:

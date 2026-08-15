@@ -46,6 +46,9 @@ TELEGRAM_SOURCE_CHANNEL=@source_chan_username
 TELEGRAM_MIRROR_CHANNEL=@mirror_chan_username
 TELEGRAM_ACTIONS_CHANNEL=@actions_chan_username
 
+# Telegram polling / refresh interval in seconds
+TELEGRAM_REFRESH_INTERVAL=10
+
 # Gemini API Settings
 GEMINI_API_KEY=your_gemini_api_key
 GEMINI_MODEL=gemini-1.5-flash

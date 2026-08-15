@@ -168,6 +168,85 @@ def get_zerodha_client() -> KiteConnect:
     kite.set_access_token(new_token)
     return kite
 
+def check_existing_zerodha_order_or_position(
+    tradingsymbol: str,
+    transaction_type: str,
+    quantity: int,
+    is_exit: bool = False
+) -> dict:
+    """
+    Checks Zerodha active orders and positions to prevent duplicate order placement.
+    Returns dict: {"duplicate": bool, "reason": str|None, "order_id": str|None, "message": str}
+    """
+    try:
+        kite = get_zerodha_client()
+        clean_symbol = str(tradingsymbol).strip().upper()
+        clean_tt = str(transaction_type).strip().upper()
+        clean_qty = int(quantity)
+
+        # 1. Check existing Zerodha orders today
+        try:
+            orders = kite.orders() or []
+            active_or_filled_statuses = ["OPEN", "COMPLETE", "TRIGGER PENDING", "AMO REQ RECEIVED", "PUT ORDER REQ RECEIVED"]
+            for o in orders:
+                o_sym = str(o.get("tradingsymbol", "")).strip().upper()
+                o_tt = str(o.get("transaction_type", "")).strip().upper()
+                o_qty = int(o.get("quantity", 0))
+                o_status = str(o.get("status", "")).strip().upper()
+
+                if o_sym == clean_symbol and o_tt == clean_tt and o_qty == clean_qty and o_status in active_or_filled_statuses:
+                    logger.info(f"Deduplication triggered: Existing order found in Zerodha for {clean_symbol} (ID: {o.get('order_id')}, Status: {o_status})")
+                    return {
+                        "duplicate": True,
+                        "reason": "existing_order",
+                        "order_id": str(o.get("order_id")),
+                        "message": f"Order already placed on Zerodha (Order ID: {o.get('order_id')}, Status: {o_status})"
+                    }
+        except Exception as oe:
+            logger.warning(f"Could not fetch Zerodha orders for deduplication check: {oe}")
+
+        # 2. Check current net position in Zerodha
+        try:
+            pos_resp = kite.positions() or {}
+            net_positions = pos_resp.get("net", []) or []
+            
+            matching_pos = None
+            for p in net_positions:
+                if str(p.get("tradingsymbol", "")).strip().upper() == clean_symbol:
+                    matching_pos = p
+                    break
+
+            if is_exit:
+                if not matching_pos or int(matching_pos.get("quantity", 0)) == 0:
+                    logger.info(f"Deduplication triggered: Position for {clean_symbol} is already closed (0) in Zerodha.")
+                    return {
+                        "duplicate": True,
+                        "reason": "position_already_closed",
+                        "order_id": None,
+                        "message": f"Exit skipped: Position for {clean_symbol} is already 0 in Zerodha."
+                    }
+            else:
+                # Entry order
+                if matching_pos:
+                    net_qty = int(matching_pos.get("quantity", 0))
+                    # If BUY order and net quantity is already positive >= clean_qty, or SELL order and net quantity <= -clean_qty
+                    if (clean_tt == "BUY" and net_qty >= clean_qty) or (clean_tt == "SELL" and net_qty <= -clean_qty):
+                        logger.info(f"Deduplication triggered: Position for {clean_symbol} already exists in Zerodha (Net Qty: {net_qty})")
+                        return {
+                            "duplicate": True,
+                            "reason": "position_already_open",
+                            "order_id": None,
+                            "message": f"Entry skipped: Net position for {clean_symbol} is already {net_qty} on Zerodha."
+                        }
+        except Exception as pe:
+            logger.warning(f"Could not fetch Zerodha positions for deduplication check: {pe}")
+
+    except Exception as e:
+        logger.warning(f"Error during Zerodha deduplication check: {e}")
+
+    return {"duplicate": False, "reason": None, "order_id": None, "message": ""}
+
+
 def place_zerodha_order(
     tradingsymbol: str,
     transaction_type: str,
