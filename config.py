@@ -28,6 +28,7 @@ def load_config():
         "ZERODHA_PROXY_URL": os.getenv("ZERODHA_PROXY_URL", "http://100.125.89.97:8888"),
         "AUTO_PLACE_ORDERS": os.getenv("AUTO_PLACE_ORDERS", "false").lower() in ("true", "1", "t", "yes"),
         "AUTO_PLACE_EXIT_ORDERS": os.getenv("AUTO_PLACE_EXIT_ORDERS", "false").lower() in ("true", "1", "t", "yes"),
+        "TARGET_INVESTMENT_BUDGET": os.getenv("TARGET_INVESTMENT_BUDGET", "100000"),
     }
 
 def update_env_variable(key: str, value: str):

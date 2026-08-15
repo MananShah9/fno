@@ -35,6 +35,7 @@ def clean_symbol(symbol: Optional[str]) -> Optional[str]:
 # Define structured schema
 class ActionSchema(BaseModel):
     action_type: str = Field(description="Must be one of: BUY, SELL, EXIT, UPDATE_SL, CLOSE_LEG, INFO")
+    is_main: Optional[bool] = Field(description="True if this is the primary/main directional leg of the trade, False if it is a hedge leg.")
     underlying: Optional[str] = Field(description="Underlying index or stock symbol ONLY in uppercase, e.g. 'NIFTY', 'BANKNIFTY', 'VBL', 'INDIGO', 'RELIANCE', 'TATASTEEL'. Do NOT include any explanations or reasoning.")
     option_type: Optional[str] = Field(description="Instrument option type: 'CE', 'PE', or 'FUT'")
     strike: Optional[float] = Field(description="Numeric strike price if option, e.g. 24000, 23600, 480, 5300, 192.5. Null for Futures.")
@@ -49,6 +50,28 @@ class ActionSchema(BaseModel):
     is_limit: Optional[bool] = Field(description="True if limit order specified, False if market/at-the-money or range not requiring a hard limit")
     details: Optional[str] = Field(description="Brief note explaining the execution instructions for this leg/order")
 
+    def __init__(self, **data):
+        defaults = {
+            "is_main": True,
+            "underlying": None,
+            "option_type": None,
+            "strike": None,
+            "expiry_info": None,
+            "order_type": None,
+            "product": None,
+            "lots": 1,
+            "instrument_name": None,
+            "price": None,
+            "stoploss": None,
+            "target": None,
+            "is_limit": False,
+            "details": None
+        }
+        for k, v in defaults.items():
+            if k not in data:
+                data[k] = v
+        super().__init__(**data)
+
 class TradeAnalysisSchema(BaseModel):
     is_valid_trade_msg: bool = Field(description="True if this message represents a valid trade setup, entry, modification, stoploss update, target update, or exit/close alert. False if it is general talk, FYI, or unrelated.")
     is_continuation: bool = Field(description="True if this message updates or closes a trade from the provided 'Open Trades Context' (e.g. updates stoploss, closes a position, target hit).")
@@ -59,18 +82,38 @@ class TradeAnalysisSchema(BaseModel):
     trade_status_update: str = Field(description="If this message closes or exits the entire trade, set this to 'CLOSED'. Otherwise, keep it 'OPEN'.")
     context_summary: Optional[str] = Field(description="A highly summarized, clear explanation (under 50 words) of the overall trade state after processing this message.")
 
+    def __init__(self, **data):
+        defaults = {
+            "is_valid_trade_msg": False,
+            "is_continuation": False,
+            "related_open_trade_id": None,
+            "structure_type": None,
+            "underlying": None,
+            "actions": [],
+            "trade_status_update": "OPEN",
+            "context_summary": None
+        }
+        for k, v in defaults.items():
+            if k not in data:
+                data[k] = v
+        super().__init__(**data)
+
 
 SYSTEM_INSTRUCTION = """
 You are an expert Indian stock market trading system assistant. Your task is to process incoming messages from a trading Telegram channel and structure them into highly actionable trading data.
 
 CRITICAL CONSTRAINTS:
 1. `underlying` MUST be strictly a single uppercase ticker symbol string, e.g. "TATASTEEL", "NIFTY", "BANKNIFTY", "INDIGO", "VBL", "RELIANCE". NEVER include reasoning, markdown, code, or extra words in `underlying`.
-2. Extract ALL actionable order legs into the `actions` array. For spreads (e.g. Bull Put Spread), extract both Sell and Buy legs as separate ActionSchema items.
-3. If a price range or limit price is specified (e.g. "@ Range (4.5-4.7) Place limit orders", "Close 24600 at 93"), set `order_type = 'LIMIT'`, `is_limit = True`, and `price` to the price value or range.
-4. For trade exit/close alerts (e.g., "SL hit Exit full position", "Close full position", "Exit 24000 PE at 90"):
+2. Extract ALL actionable order legs into the `actions` array. For spreads (e.g. Bull Put Spread, Bear Fut Spread), extract both Sell and Buy legs as separate ActionSchema items.
+3. Classify `is_main` for each leg:
+   - For Future + Option spreads (e.g. Bear Fut Spread): the Futures leg is `is_main = True`, and the Option leg is `is_main = False` (hedge).
+   - For Option Credit Spreads (e.g. Bull Put Spread, Bear Call Spread): the SELL (short) leg is `is_main = True`, and the BUY (long) leg is `is_main = False` (hedge).
+   - For single-leg trades: `is_main = True`.
+4. If a price range or limit price is specified (e.g. "@ Range (4.5-4.7) Place limit orders", "Close 24600 at 93"), set `order_type = 'LIMIT'`, `is_limit = True`, and `price` to the price value or range.
+5. For trade exit/close alerts (e.g., "SL hit Exit full position", "Close full position", "Exit 24000 PE at 90"):
    - Set `is_valid_trade_msg = True`, `is_continuation = True`, `related_open_trade_id` to the matching trade from Open Trades Context, and `trade_status_update = 'CLOSED'`.
    - If specific exit prices are given for legs, extract `action_type = 'EXIT'` with `order_type = 'LIMIT'` and the `price`.
-5. Keep `context_summary` extremely concise (under 50 words).
+6. Keep `context_summary` extremely concise (under 50 words).
 """
 
 def analyze_message_with_ai(message_text: str, open_trades: List[Dict[str, Any]]) -> Optional[TradeAnalysisSchema]:
@@ -142,8 +185,18 @@ Please analyze the message above against the active open trades and return a hig
 
         if "actions" in result_json and isinstance(result_json["actions"], list):
             for act in result_json["actions"]:
-                if isinstance(act, dict) and "underlying" in act:
-                    act["underlying"] = clean_symbol(act["underlying"])
+                if isinstance(act, dict):
+                    if "underlying" in act:
+                        act["underlying"] = clean_symbol(act["underlying"])
+                    for k in ["order_type", "product", "instrument_name", "price", "stoploss", "target", "details", "strike", "expiry_info", "option_type"]:
+                        if k not in act:
+                            act[k] = None
+                    if "is_limit" not in act or act["is_limit"] is None:
+                        act["is_limit"] = False
+                    if "lots" not in act or act["lots"] is None:
+                        act["lots"] = 1
+                    if "is_main" not in act or act["is_main"] is None:
+                        act["is_main"] = True
 
         return TradeAnalysisSchema(**result_json)
 

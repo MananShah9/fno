@@ -12,8 +12,8 @@ import db
 from models import Message, Trade, Action
 from telegram_client import client, check_login, get_channel_entity
 from gemini_client import analyze_message_with_ai, clean_symbol
-from instruments_manager import resolve_nfo_instrument
-from zerodha_client import place_zerodha_order, check_existing_zerodha_order_or_position
+from instruments_manager import resolve_nfo_instrument, parse_price_value, calculate_lots_from_budget
+from zerodha_client import place_zerodha_order, check_existing_zerodha_order_or_position, get_nfo_ltp
 
 load_dotenv()
 
@@ -106,7 +106,9 @@ def format_action_telegram_message_html(trade: Trade, actions: list) -> str:
         if action.transaction_type:
             detail_parts.append(f"Side: <b>{action.transaction_type}</b>")
         if action.quantity:
-            detail_parts.append(f"Qty: <b>{action.quantity}</b> ({action.lots or 1} lot)")
+            lots_num = action.lots or 1
+            lots_text = f"{lots_num} lot" if lots_num == 1 else f"{lots_num} lots"
+            detail_parts.append(f"Qty: <b>{action.quantity}</b> ({lots_text})")
         if action.order_type:
             detail_parts.append(f"Type: <b>{action.order_type}</b>")
         if action.price:
@@ -193,6 +195,7 @@ def ensure_square_off_actions(session: Session, trade: Trade, db_message: Messag
             trade_id=trade.id,
             message_id=db_message.id,
             action_type="EXIT",
+            is_main=getattr(entry_act, "is_main", True),
             instrument_name=entry_act.instrument_name,
             price=limit_price,
             stoploss=None,
@@ -220,6 +223,178 @@ def ensure_square_off_actions(session: Session, trade: Trade, db_message: Messag
 
     session.commit()
     return new_square_off_actions
+
+
+def process_trade_actions_and_sizing(
+    trade: Trade,
+    db_message_id: int,
+    parsed_actions: list,
+    target_budget: float = None
+) -> list:
+    """
+    Resolves NFO instruments, determines main vs hedge leg roles,
+    calculates trade lots from target investment budget (.env), ensures hedge
+    quantity matches main quantity, and returns list of Action DB objects.
+    """
+    if target_budget is None:
+        raw_budget = os.getenv("TARGET_INVESTMENT_BUDGET") or os.getenv("TARGET_INVESTMENT_BUDGET_MAIN")
+        if raw_budget:
+            try:
+                target_budget = float(raw_budget)
+            except (ValueError, TypeError):
+                target_budget = None
+
+    resolved_items = []
+    entry_indices = []
+
+    for idx, action_schema in enumerate(parsed_actions):
+        u_symbol = clean_symbol(getattr(action_schema, "underlying", None) or trade.underlying)
+        o_type = getattr(action_schema, "option_type", None) or "CE"
+        strike_val = getattr(action_schema, "strike", None)
+        expiry_str = getattr(action_schema, "expiry_info", None)
+
+        inst = resolve_nfo_instrument(u_symbol, strike_val, o_type, expiry_str)
+        action_type = getattr(action_schema, "action_type", "INFO").upper()
+
+        resolved_items.append({
+            "schema": action_schema,
+            "action_type": action_type,
+            "underlying": u_symbol,
+            "option_type": o_type,
+            "strike": strike_val,
+            "expiry": inst["expiry"] if inst else expiry_str,
+            "inst": inst,
+            "is_main": True,
+            "lots": getattr(action_schema, "lots", None) or 1,
+            "quantity": None
+        })
+
+        if action_type in ["BUY", "SELL"]:
+            entry_indices.append(idx)
+
+    # If there are entry legs, determine main vs hedge and calculate lot sizing
+    if entry_indices:
+        # 1. Identify MAIN leg index
+        main_idx = entry_indices[0]
+        explicit_mains = [i for i in entry_indices if getattr(resolved_items[i]["schema"], "is_main", None) is True]
+        if len(explicit_mains) == 1:
+            main_idx = explicit_mains[0]
+        else:
+            # Prefer FUT leg as main
+            fut_legs = [i for i in entry_indices if resolved_items[i]["option_type"] == "FUT"]
+            if fut_legs:
+                main_idx = fut_legs[0]
+            else:
+                # Prefer SELL leg as main in credit spreads
+                sell_legs = [i for i in entry_indices if resolved_items[i]["action_type"] == "SELL"]
+                buy_legs = [i for i in entry_indices if resolved_items[i]["action_type"] == "BUY"]
+                if sell_legs and buy_legs:
+                    main_idx = sell_legs[0]
+                else:
+                    # Choose leg with highest price
+                    best_price = -1.0
+                    for i in entry_indices:
+                        p = parse_price_value(getattr(resolved_items[i]["schema"], "price", None)) or 0.0
+                        if p > best_price:
+                            best_price = p
+                            main_idx = i
+
+        main_item = resolved_items[main_idx]
+        main_inst = main_item["inst"]
+        main_lot_size = main_inst["lot_size"] if main_inst else 1
+
+        # 2. Determine price for main leg
+        main_price = parse_price_value(getattr(main_item["schema"], "price", None))
+        if (main_price is None or main_price <= 0) and main_inst:
+            try:
+                main_price = get_nfo_ltp(main_inst.get("tradingsymbol"))
+            except Exception as le:
+                logger.warning(f"Failed to fetch live LTP for {main_inst.get('tradingsymbol')}: {le}")
+
+        # 3. Calculate lots for main leg
+        calculated_lots = calculate_lots_from_budget(main_price, main_lot_size, target_budget)
+        main_quantity = calculated_lots * main_lot_size
+
+        logger.info(
+            f"Trade #{trade.id if trade else 'N/A'} Target Budget Sizing: "
+            f"budget={target_budget}, main_price={main_price}, lot_size={main_lot_size} -> "
+            f"lots={calculated_lots}, main_qty={main_quantity}"
+        )
+
+        # 4. Set sizing and role for all entry legs
+        for i in entry_indices:
+            is_this_main = (i == main_idx)
+            resolved_items[i]["is_main"] = is_this_main
+            resolved_items[i]["lots"] = calculated_lots
+            # "hedge qty will be always same as main qty"
+            resolved_items[i]["quantity"] = main_quantity
+
+    # For exit legs directly in message, try to match existing open legs
+    for idx, item in enumerate(resolved_items):
+        if item["action_type"] in ["EXIT", "CLOSE_LEG"] and item["quantity"] is None:
+            inst = item["inst"]
+            lot_sz = inst["lot_size"] if inst else 1
+            matched_qty = None
+            matched_lots = 1
+            if trade and getattr(trade, "actions", None):
+                for prior_act in trade.actions:
+                    if prior_act.action_type in ["BUY", "SELL"] and prior_act.quantity:
+                        if (prior_act.tradingsymbol and inst and prior_act.tradingsymbol == inst.get("tradingsymbol")) or \
+                           (prior_act.strike and item["strike"] and abs(prior_act.strike - item["strike"]) < 0.01):
+                            matched_qty = prior_act.quantity
+                            matched_lots = prior_act.lots or 1
+                            break
+            item["lots"] = matched_lots
+            item["quantity"] = matched_qty or (matched_lots * lot_sz)
+
+    # Build and return Action database objects
+    actions_to_add = []
+    for item in resolved_items:
+        schema = item["schema"]
+        inst = item["inst"]
+        action_type = item["action_type"]
+        o_type = item["option_type"]
+
+        # Resolve transaction type
+        trans_type = "BUY"
+        if action_type == "SELL":
+            trans_type = "SELL"
+        elif action_type == "BUY":
+            trans_type = "BUY"
+        elif action_type in ["EXIT", "CLOSE_LEG"]:
+            trans_type = "BUY" if o_type == "PE" or "SELL" in (getattr(schema, "details", None) or "").upper() else "SELL"
+
+        # Resolve order type
+        ord_type = "LIMIT" if (getattr(schema, "order_type", None) == "LIMIT" or getattr(schema, "is_limit", False)) else "MARKET"
+
+        db_action = Action(
+            trade_id=trade.id if trade else None,
+            message_id=db_message_id,
+            action_type=action_type,
+            is_main=item["is_main"],
+            instrument_name=getattr(schema, "instrument_name", None),
+            price=getattr(schema, "price", None),
+            stoploss=getattr(schema, "stoploss", None),
+            target=getattr(schema, "target", None),
+            is_limit=getattr(schema, "is_limit", False),
+            details=getattr(schema, "details", None),
+            telegram_sent=False,
+            underlying=item["underlying"],
+            option_type=o_type,
+            strike=item["strike"],
+            expiry=item["expiry"],
+            lots=item["lots"],
+            quantity=item["quantity"],
+            tradingsymbol=inst["tradingsymbol"] if inst else None,
+            instrument_token=inst["instrument_token"] if inst else None,
+            transaction_type=trans_type,
+            order_type=ord_type,
+            product=getattr(schema, "product", None) or "NRML",
+            order_status="PENDING"
+        )
+        actions_to_add.append(db_action)
+
+    return actions_to_add
 
 
 def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = False) -> list:
@@ -482,59 +657,14 @@ async def sync_and_process():
                         
                         session.commit()
 
-                        # Save Actions and resolve Zerodha instrument details
-                        db_actions = []
-                        for action in analysis.actions:
-                            u_symbol = clean_symbol(action.underlying or analysis.underlying or trade.underlying)
-                            o_type = action.option_type or "CE"
-                            strike_val = action.strike
-                            expiry_str = action.expiry_info
-
-                            # Look up NFO instrument details
-                            inst = resolve_nfo_instrument(u_symbol, strike_val, o_type, expiry_str)
-
-                            lots_count = action.lots or 1
-                            qty = (lots_count * inst["lot_size"]) if inst else None
-
-                            # Resolve transaction type
-                            trans_type = "BUY"
-                            if action.action_type == "SELL":
-                                trans_type = "SELL"
-                            elif action.action_type == "BUY":
-                                trans_type = "BUY"
-                            elif action.action_type in ["EXIT", "CLOSE_LEG"]:
-                                # Flip side based on original leg if possible
-                                trans_type = "BUY" if o_type == "PE" or "SELL" in (action.details or "").upper() else "SELL"
-
-                            # Resolve order type
-                            ord_type = "LIMIT" if (action.order_type == "LIMIT" or action.is_limit) else "MARKET"
-
-                            db_action = Action(
-                                trade_id=trade.id,
-                                message_id=db_message.id,
-                                action_type=action.action_type,
-                                instrument_name=action.instrument_name,
-                                price=action.price,
-                                stoploss=action.stoploss,
-                                target=action.target,
-                                is_limit=action.is_limit,
-                                details=action.details,
-                                telegram_sent=False,
-                                underlying=u_symbol,
-                                option_type=o_type,
-                                strike=strike_val,
-                                expiry=inst["expiry"] if inst else expiry_str,
-                                lots=lots_count,
-                                quantity=qty,
-                                tradingsymbol=inst["tradingsymbol"] if inst else None,
-                                instrument_token=inst["instrument_token"] if inst else None,
-                                transaction_type=trans_type,
-                                order_type=ord_type,
-                                product=action.product or "NRML",
-                                order_status="PENDING"
-                            )
+                        # Save Actions and resolve Zerodha instrument details with target budget lot sizing
+                        db_actions = process_trade_actions_and_sizing(
+                            trade=trade,
+                            db_message_id=db_message.id,
+                            parsed_actions=analysis.actions
+                        )
+                        for db_action in db_actions:
                             session.add(db_action)
-                            db_actions.append(db_action)
                         
                         session.commit()
 

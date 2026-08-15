@@ -9,7 +9,7 @@ import db
 from models import Message, Trade, Action
 from gemini_client import analyze_message_with_ai, clean_symbol
 from instruments_manager import resolve_nfo_instrument
-from worker import get_open_trades_context, format_action_telegram_message_html
+from worker import get_open_trades_context, format_action_telegram_message_html, process_trade_actions_and_sizing
 
 load_dotenv()
 
@@ -124,51 +124,14 @@ async def run_simulation():
                 print(f"[+] Trade ID #{trade.id} is now CLOSED.")
             session.commit()
             
-            # Create Actions and resolve NFO instruments
-            db_actions = []
-            for action_schema in analysis.actions:
-                u_symbol = clean_symbol(action_schema.underlying or analysis.underlying or trade.underlying)
-                o_type = action_schema.option_type or "CE"
-                inst = resolve_nfo_instrument(u_symbol, action_schema.strike, o_type, action_schema.expiry_info)
-                lots_count = action_schema.lots or 1
-                qty = (lots_count * inst["lot_size"]) if inst else None
-
-                trans_type = "BUY"
-                if action_schema.action_type == "SELL":
-                    trans_type = "SELL"
-                elif action_schema.action_type == "BUY":
-                    trans_type = "BUY"
-                elif action_schema.action_type in ["EXIT", "CLOSE_LEG"]:
-                    trans_type = "BUY" if o_type == "PE" else "SELL"
-
-                ord_type = "LIMIT" if (action_schema.order_type == "LIMIT" or action_schema.is_limit) else "MARKET"
-
-                db_action = Action(
-                    trade_id=trade.id,
-                    message_id=msg_obj.id,
-                    action_type=action_schema.action_type,
-                    instrument_name=action_schema.instrument_name,
-                    price=action_schema.price,
-                    stoploss=action_schema.stoploss,
-                    target=action_schema.target,
-                    is_limit=action_schema.is_limit,
-                    details=action_schema.details,
-                    telegram_sent=True,
-                    underlying=u_symbol,
-                    option_type=o_type,
-                    strike=action_schema.strike,
-                    expiry=inst["expiry"] if inst else action_schema.expiry_info,
-                    lots=lots_count,
-                    quantity=qty,
-                    tradingsymbol=inst["tradingsymbol"] if inst else None,
-                    instrument_token=inst["instrument_token"] if inst else None,
-                    transaction_type=trans_type,
-                    order_type=ord_type,
-                    product=action_schema.product or "NRML",
-                    order_status="PENDING"
-                )
+            # Create Actions and resolve NFO instruments with target budget lot sizing
+            db_actions = process_trade_actions_and_sizing(
+                trade=trade,
+                db_message_id=msg_obj.id,
+                parsed_actions=analysis.actions
+            )
+            for db_action in db_actions:
                 session.add(db_action)
-                db_actions.append(db_action)
             session.commit()
 
             # Automatic Square-Off Generation for closed trades / exits

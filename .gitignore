@@ -156,3 +156,6 @@ Thumbs.db
 # Project-specific exclusions
 sessions/
 *.session
+
+
+data/*

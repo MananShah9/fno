@@ -151,18 +151,21 @@ def view_trade_details(trade_id: int, session: Session):
     else:
         actions_data = []
         for act in actions:
+            role = "Main" if getattr(act, "is_main", True) else "Hedge"
+            qty_str = f"{act.quantity} ({act.lots or 1}L)" if act.quantity else "N/A"
             actions_data.append([
                 act.id,
                 act.action_type,
-                act.instrument_name or "N/A",
+                role,
+                act.tradingsymbol or act.instrument_name or "N/A",
+                qty_str,
                 act.price or "N/A",
                 act.stoploss or "N/A",
                 act.target or "N/A",
-                "Yes" if act.is_limit else "No",
-                truncate_text(act.details, 30),
+                act.order_status or "PENDING",
                 "✅ Yes" if act.telegram_sent else "❌ No"
             ])
-        print(tabulate(actions_data, headers=["ID", "Type", "Instrument", "Price", "SL", "Target", "Limit?", "Note", "Tg Sent?"], tablefmt="grid"))
+        print(tabulate(actions_data, headers=["ID", "Type", "Role", "Instrument", "Qty (Lots)", "Price", "SL", "Target", "Status", "Tg Sent?"], tablefmt="grid"))
         
     input("\nPress Enter to go back...")
 
@@ -176,17 +179,22 @@ def view_all_actions():
         else:
             table_data = []
             for act in actions:
+                role = "Main" if getattr(act, "is_main", True) else "Hedge"
+                qty_str = f"{act.quantity} ({act.lots or 1}L)" if act.quantity else "N/A"
                 table_data.append([
                     act.id,
                     f"Trade #{act.trade_id}" if act.trade_id else "N/A",
                     act.action_type,
-                    act.instrument_name or "N/A",
+                    role,
+                    act.tradingsymbol or act.instrument_name or "N/A",
+                    qty_str,
                     act.price or "N/A",
                     act.stoploss or "N/A",
                     act.target or "N/A",
+                    act.order_status or "PENDING",
                     "✅ Yes" if act.telegram_sent else "❌ No"
                 ])
-            print(tabulate(table_data, headers=["ID", "Trade Ref", "Type", "Instrument Search (Zerodha)", "Price", "SL", "Target", "Sent to Tg?"], tablefmt="grid"))
+            print(tabulate(table_data, headers=["ID", "Trade Ref", "Type", "Role", "Instrument", "Qty (Lots)", "Price", "SL", "Target", "Status", "Sent to Tg?"], tablefmt="grid"))
     finally:
         session.close()
     input("\nPress Enter to return to main menu...")
@@ -208,10 +216,11 @@ def manage_config_menu():
         print(f"9. GEMINI_MODEL:          {cfg['GEMINI_MODEL']}")
         print(f"10. AUTO_PLACE_ORDERS:     {cfg['AUTO_PLACE_ORDERS']}")
         print(f"11. AUTO_PLACE_EXIT_ORDERS: {cfg['AUTO_PLACE_EXIT_ORDERS']}")
-        print(f"12. 🔙 Return to Main Menu")
+        print(f"12. TARGET_INVESTMENT_BUDGET: Rs. {cfg.get('TARGET_INVESTMENT_BUDGET', '100000')}")
+        print(f"13. 🔙 Return to Main Menu")
         
-        choice = input("\nSelect setting to edit (1-12): ").strip()
-        if choice == '12':
+        choice = input("\nSelect setting to edit (1-13): ").strip()
+        if choice == '13':
             break
             
         env_map = {
@@ -225,7 +234,8 @@ def manage_config_menu():
             '8': 'GEMINI_API_KEY',
             '9': 'GEMINI_MODEL',
             '10': 'AUTO_PLACE_ORDERS',
-            '11': 'AUTO_PLACE_EXIT_ORDERS'
+            '11': 'AUTO_PLACE_EXIT_ORDERS',
+            '12': 'TARGET_INVESTMENT_BUDGET'
         }
         
         if choice in env_map:

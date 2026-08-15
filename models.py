@@ -57,6 +57,7 @@ class Action(Base):
     telegram_sent = Column(Boolean, default=False, index=True)
 
     # Zerodha Execution Parameters
+    is_main = Column(Boolean, default=True)           # True if main/primary leg, False if hedge leg
     underlying = Column(String, nullable=True)
     option_type = Column(String, nullable=True)
     strike = Column(Float, nullable=True)

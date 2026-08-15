@@ -1,4 +1,5 @@
 import os
+import re
 import csv
 import io
 import logging
@@ -165,3 +166,59 @@ def format_instrument_result(row: Dict[str, Any]) -> Dict[str, Any]:
         "segment": row.get("segment", "NFO-OPT"),
         "exchange": row.get("exchange", "NFO")
     }
+
+def parse_price_value(price_val: Any) -> Optional[float]:
+    """
+    Parses a price string, range, or number into a single float price.
+    Examples:
+      '183' -> 183.0
+      '467-468' -> 467.5 (midpoint)
+      '4.5-4.7' -> 4.6
+      '@ 81' -> 81.0
+      461.9 -> 461.9
+    """
+    if price_val is None:
+        return None
+    if isinstance(price_val, (int, float)):
+        try:
+            val = float(price_val)
+            return val if val > 0 else None
+        except (ValueError, TypeError):
+            return None
+    
+    s = str(price_val).strip()
+    # Extract numeric portions (integers or decimals)
+    nums = re.findall(r'\d+(?:\.\d+)?', s)
+    if not nums:
+        return None
+    try:
+        if len(nums) == 1:
+            return float(nums[0])
+        # If range like 467-468 or 4.5-4.7, return average of the first two numbers
+        return (float(nums[0]) + float(nums[1])) / 2.0
+    except (ValueError, TypeError):
+        return None
+
+def calculate_lots_from_budget(
+    main_price: Optional[float],
+    lot_size: int,
+    target_budget: Optional[float] = None
+) -> int:
+    """
+    Calculates the number of lots to trade based on the target investment budget.
+    Formula: nearest lot multiple = round(target_budget / (main_price * lot_size))
+    Returns at least 1 lot.
+    """
+    if target_budget is None or target_budget <= 0:
+        return 1
+    if not main_price or main_price <= 0 or not lot_size or lot_size <= 0:
+        return 1
+
+    single_lot_cost = main_price * lot_size
+    if single_lot_cost <= 0:
+        return 1
+
+    target_lots = target_budget / single_lot_cost
+    lots = round(target_lots)
+    return max(1, int(lots))
+

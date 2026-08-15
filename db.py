@@ -60,6 +60,7 @@ def init_db():
     if 'actions' in inspector.get_table_names():
         existing_cols = [col['name'] for col in inspector.get_columns('actions')]
         new_cols = {
+            "is_main": "BOOLEAN DEFAULT TRUE",
             "underlying": "VARCHAR",
             "option_type": "VARCHAR",
             "strike": "DOUBLE PRECISION",

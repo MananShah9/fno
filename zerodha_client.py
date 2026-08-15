@@ -3,6 +3,7 @@ import json
 import logging
 import urllib.parse
 from datetime import datetime
+from typing import Optional, Dict, Any, List
 import requests
 import pyotp
 from kiteconnect import KiteConnect
@@ -167,6 +168,23 @@ def get_zerodha_client() -> KiteConnect:
     new_token = generate_access_token_via_totp()
     kite.set_access_token(new_token)
     return kite
+
+def get_nfo_ltp(tradingsymbol: str) -> Optional[float]:
+    """
+    Fetches the live Last Traded Price (LTP) for an NFO instrument from Zerodha.
+    Returns float price or None if unavailable.
+    """
+    if not tradingsymbol:
+        return None
+    try:
+        kite = get_zerodha_client()
+        key = f"NFO:{tradingsymbol.strip().upper()}"
+        res = kite.ltp(key)
+        if res and key in res and "last_price" in res[key]:
+            return float(res[key]["last_price"])
+    except Exception as e:
+        logger.warning(f"Could not fetch live LTP for {tradingsymbol}: {e}")
+    return None
 
 def check_existing_zerodha_order_or_position(
     tradingsymbol: str,
