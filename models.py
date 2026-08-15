@@ -15,9 +15,14 @@ class Message(Base):
     processed_at = Column(DateTime, nullable=True)
     analysed_by_ai = Column(Boolean, default=False, index=True)
     ai_response = Column(Text, nullable=True)
+    revision = Column(Integer, default=0, index=True)
+    last_stage = Column(String, nullable=True)
+    last_status = Column(String, nullable=True)
+    last_error = Column(Text, nullable=True)
 
     # Relationships
     actions = relationship("Action", back_populates="message", cascade="all, delete-orphan")
+    stage_traces = relationship("MessageStageTrace", back_populates="message", cascade="all, delete-orphan", order_by="MessageStageTrace.id.asc()")
 
     def __repr__(self):
         return f"<Message(id={self.id}, tg_id={self.telegram_message_id}, processed={self.processed})>"
@@ -36,6 +41,7 @@ class Trade(Base):
 
     # Relationships
     actions = relationship("Action", back_populates="trade")
+    stage_traces = relationship("MessageStageTrace", back_populates="trade")
 
     def __repr__(self):
         return f"<Trade(id={self.id}, status={self.status}, underlying={self.underlying}, type={self.structure_type})>"
@@ -80,3 +86,28 @@ class Action(Base):
 
     def __repr__(self):
         return f"<Action(id={self.id}, type={self.action_type}, symbol={self.tradingsymbol}, status={self.order_status})>"
+
+
+class MessageStageTrace(Base):
+    __tablename__ = 'message_stage_traces'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    message_id = Column(Integer, ForeignKey('messages.id', ondelete='CASCADE'), nullable=True, index=True)
+    telegram_message_id = Column(Integer, nullable=True, index=True)
+    trade_id = Column(Integer, ForeignKey('trades.id', ondelete='SET NULL'), nullable=True, index=True)
+    revision = Column(Integer, default=0, index=True)
+    stage = Column(String, nullable=False, index=True)
+    status = Column(String, default="SUCCESS", index=True)  # "SUCCESS", "WARNING", "ERROR", "SKIPPED", "INFO", "IN_PROGRESS"
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    duration_ms = Column(Float, nullable=True)
+    location = Column(String, nullable=True)
+    details = Column(Text, nullable=True)
+    error_message = Column(Text, nullable=True)
+    stack_trace = Column(Text, nullable=True)
+
+    # Relationships
+    message = relationship("Message", back_populates="stage_traces")
+    trade = relationship("Trade", back_populates="stage_traces")
+
+    def __repr__(self):
+        return f"<MessageStageTrace(id={self.id}, msg_id={self.message_id}, stage={self.stage}, status={self.status}, loc={self.location})>"

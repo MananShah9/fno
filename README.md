@@ -152,6 +152,15 @@ To view messages, monitor open/closed trades, check order logs, and manage confi
 python main.py cli
 ```
 
+#### Run Message Stage Diagnostics & Tracing
+To inspect stage-wise execution timelines, latencies, code locations, and errors for any message:
+```bash
+python main.py trace --recent      # View recent message health summary
+python main.py trace <message_id>  # Full stage timeline for message
+python main.py trace --stuck       # View stuck/failed messages
+```
+*(For comprehensive details, see [`DIAGNOSTICS_AND_DATA_ACCESS.md`](./DIAGNOSTICS_AND_DATA_ACCESS.md)).*
+
 ---
 
 ## 📂 Project Structure
@@ -159,16 +168,20 @@ python main.py cli
 ```
 .
 ├── sessions/                # Stores your persistent Telegram user sessions (Git ignored)
-├── cli.py                   # Command-line interface dashboard
+├── cli.py                   # Command-line interface dashboard & diagnostics viewer
 ├── config.py                # Environment configuration loader and updater
-├── db.py                    # SQLAlchemy connection and table initialization
+├── db.py                    # SQLAlchemy connection and table initialization & migrations
 ├── docker-compose.yml       # Docker definition for DB & Worker App services
 ├── Dockerfile               # Production multi-stage Docker build for the app
 ├── gemini_client.py         # Google Gemini integration & structured extraction prompt
-├── main.py                  # Entrypoint router (Worker or CLI mode)
-├── models.py                # Database models (Message, Trade, Action)
+├── instruments_manager.py   # NFO contract resolver & budget lot sizing calculator
+├── main.py                  # Entrypoint router (Worker, CLI, Trace, Simulator)
+├── models.py                # Database models (Message, Trade, Action, MessageStageTrace)
 ├── requirements.txt         # Project requirements
+├── stage_tracker.py         # Stage diagnostic tracer & timing context managers
 ├── telegram_client.py       # Telethon client wrapper & channel resolver
-├── test_simulator.py        # Local script to test parse actions and sync
+├── test_simulator.py        # Local simulation script with stage tracing verification
+├── zerodha_client.py        # Zerodha Kite Connect order execution & proxy handler
+├── DIAGNOSTICS_AND_DATA_ACCESS.md # Full guide on debugging and analyzing message stage data
 └── worker.py                # Sync scheduler, context builder, and HTML notification compiler
 ```

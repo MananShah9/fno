@@ -227,4 +227,4 @@ Please analyze the message above against the active open trades and return a hig
 
     except Exception as e:
         logger.exception(f"Error during Gemini analysis: {e}")
-        return None
+        raise

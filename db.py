@@ -43,7 +43,7 @@ def init_db():
     
     inspector = inspect(engine)
     
-    # 1. Ensure analysed_by_ai column exists in messages table
+    # 1. Ensure analysed_by_ai and stage diagnostics columns exist in messages table
     if 'messages' in inspector.get_table_names():
         columns = [col['name'] for col in inspector.get_columns('messages')]
         if 'analysed_by_ai' not in columns:
@@ -55,6 +55,21 @@ def init_db():
                 except Exception as ie:
                     print(f"Index creation warning/error: {ie}")
             print("[+] Migration completed successfully.")
+
+        msg_extra_cols = {
+            "revision": "INTEGER DEFAULT 0",
+            "last_stage": "VARCHAR",
+            "last_status": "VARCHAR",
+            "last_error": "TEXT"
+        }
+        with engine.begin() as conn:
+            for col_name, col_type in msg_extra_cols.items():
+                if col_name not in columns:
+                    print(f"[*] Migration: Adding {col_name} column to messages table...")
+                    try:
+                        conn.execute(text(f"ALTER TABLE messages ADD COLUMN {col_name} {col_type}"))
+                    except Exception as me:
+                        print(f"Migration column error ({col_name}): {me}")
 
     # 2. Ensure Zerodha execution columns exist in actions table
     if 'actions' in inspector.get_table_names():

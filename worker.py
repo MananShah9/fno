@@ -14,6 +14,7 @@ from telegram_client import client, check_login, get_channel_entity
 from gemini_client import analyze_message_with_ai, clean_symbol, is_poke_message
 from instruments_manager import resolve_nfo_instrument, parse_price_value, calculate_lots_from_budget
 from zerodha_client import place_zerodha_order, check_existing_zerodha_order_or_position, get_nfo_ltp
+from stage_tracker import record_stage, StageContext, get_code_location
 
 load_dotenv()
 
@@ -418,6 +419,15 @@ def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = Fal
     for action in actions:
         if not action.tradingsymbol or not action.quantity:
             logger.warning(f"Action ID {action.id} missing tradingsymbol or quantity. Skipping order placement.")
+            record_stage(
+                stage="ORDER_EXECUTION_SKIPPED",
+                status="WARNING",
+                message_id=action.message_id,
+                trade_id=action.trade_id,
+                details={"action_id": action.id, "reason": "Missing tradingsymbol or quantity", "action_type": action.action_type},
+                error_message="Missing tradingsymbol or quantity for order execution",
+                session=session
+            )
             continue
 
         is_exit = action.action_type in ["EXIT", "CLOSE_LEG"]
@@ -426,9 +436,25 @@ def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = Fal
         if auto_mode:
             if is_exit and not auto_exit:
                 logger.info(f"Skipping auto-placement for Exit Action ID {action.id} (AUTO_PLACE_EXIT_ORDERS is false).")
+                record_stage(
+                    stage="ORDER_AUTO_PLACEMENT_SKIPPED",
+                    status="INFO",
+                    message_id=action.message_id,
+                    trade_id=action.trade_id,
+                    details={"action_id": action.id, "tradingsymbol": action.tradingsymbol, "reason": "AUTO_PLACE_EXIT_ORDERS is false", "is_exit": True},
+                    session=session
+                )
                 continue
             elif not is_exit and not auto_entry:
                 logger.info(f"Skipping auto-placement for Entry Action ID {action.id} (AUTO_PLACE_ORDERS is false).")
+                record_stage(
+                    stage="ORDER_AUTO_PLACEMENT_SKIPPED",
+                    status="INFO",
+                    message_id=action.message_id,
+                    trade_id=action.trade_id,
+                    details={"action_id": action.id, "tradingsymbol": action.tradingsymbol, "reason": "AUTO_PLACE_ORDERS is false", "is_exit": False},
+                    session=session
+                )
                 continue
 
         # 1. Deduplication check against existing Zerodha orders & positions
@@ -446,6 +472,21 @@ def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = Fal
             if dedup_check.get("order_id"):
                 action.zerodha_order_id = dedup_check["order_id"]
             session.commit()
+
+            record_stage(
+                stage="ORDER_DEDUPLICATED",
+                status="INFO",
+                message_id=action.message_id,
+                trade_id=action.trade_id,
+                details={
+                    "action_id": action.id,
+                    "tradingsymbol": action.tradingsymbol,
+                    "reason": dedup_check["reason"],
+                    "order_id": action.zerodha_order_id,
+                    "message": dedup_check["message"]
+                },
+                session=session
+            )
 
             results.append({
                 "action_id": action.id,
@@ -483,9 +524,41 @@ def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = Fal
             action.zerodha_order_id = res["order_id"]
             action.zerodha_response = res["message"]
             action.placed_at = datetime.utcnow()
+            record_stage(
+                stage="ORDER_PLACED",
+                status="SUCCESS",
+                message_id=action.message_id,
+                trade_id=action.trade_id,
+                details={
+                    "action_id": action.id,
+                    "tradingsymbol": action.tradingsymbol,
+                    "transaction_type": action.transaction_type,
+                    "quantity": action.quantity,
+                    "order_type": action.order_type,
+                    "price": limit_price,
+                    "order_id": res["order_id"]
+                },
+                session=session
+            )
         else:
             action.order_status = "FAILED"
             action.zerodha_response = res["message"]
+            record_stage(
+                stage="ORDER_FAILED",
+                status="ERROR",
+                message_id=action.message_id,
+                trade_id=action.trade_id,
+                error_message=res["message"],
+                details={
+                    "action_id": action.id,
+                    "tradingsymbol": action.tradingsymbol,
+                    "transaction_type": action.transaction_type,
+                    "quantity": action.quantity,
+                    "order_type": action.order_type,
+                    "price": limit_price
+                },
+                session=session
+            )
 
         session.commit()
         results.append({
@@ -512,12 +585,22 @@ def setup_telegram_event_handlers():
 
             session = db.SessionLocal()
             try:
+                record_stage(
+                    stage="TELEGRAM_BUTTON_CLICKED",
+                    status="INFO",
+                    trade_id=trade_id,
+                    details={"action": "place_order", "trade_id": trade_id},
+                    session=session
+                )
+
                 trade = session.query(Trade).filter(Trade.id == trade_id).first()
                 if not trade:
                     await event.respond("❌ Trade not found in database.")
                     return
 
-                results = execute_trade_actions(session, trade_id)
+                with StageContext("MANUAL_ORDER_EXECUTION", trade_id=trade_id, session=session) as ctx:
+                    results = execute_trade_actions(session, trade_id)
+                    ctx.set_details({"trade_id": trade_id, "results": results})
 
                 if not results:
                     await event.respond(f"ℹ️ No pending orders found for Trade #{trade_id} or orders already placed.")
@@ -585,12 +668,38 @@ def setup_telegram_event_handlers():
                 ).first()
 
                 if db_message:
+                    # Increment message revision
+                    current_rev = (db_message.revision or 0) + 1
+                    db_message.revision = current_rev
+
+                    record_stage(
+                        stage="MESSAGE_EDIT_DETECTED",
+                        status="INFO",
+                        message_id=db_message.id,
+                        telegram_message_id=msg.id,
+                        revision=current_rev,
+                        details={"text_snippet": msg.text[:100], "revision": current_rev},
+                        session=session
+                    )
+
                     # Check if this message produced action items (Action records in DB)
                     action_count = session.query(Action).filter(Action.message_id == db_message.id).count()
                     if action_count > 0:
                         logger.info(
                             f"Message ID {msg.id} (DB ID {db_message.id}) was already processed as an ACTION ITEM "
                             f"({action_count} actions exist). Skipping reprocessing."
+                        )
+                        record_stage(
+                            stage="EDIT_REPROCESSING_SKIPPED",
+                            status="SKIPPED",
+                            message_id=db_message.id,
+                            telegram_message_id=msg.id,
+                            revision=current_rev,
+                            details={
+                                "reason": f"Message already has {action_count} executed action items in DB. Skipping duplicate processing.",
+                                "action_count": action_count
+                            },
+                            session=session
                         )
                         return
 
@@ -603,6 +712,16 @@ def setup_telegram_event_handlers():
                     db_message.analysed_by_ai = False
                     db_message.ai_response = None
                     session.commit()
+
+                    record_stage(
+                        stage="EDIT_REPROCESSING_STARTED",
+                        status="INFO",
+                        message_id=db_message.id,
+                        telegram_message_id=msg.id,
+                        revision=current_rev,
+                        details={"revision": current_rev, "updated_text": msg.text[:100]},
+                        session=session
+                    )
                 else:
                     logger.info(f"Edited Message ID {msg.id} was not present in DB. Creating new record for processing.")
                     db_message = Message(
@@ -611,11 +730,22 @@ def setup_telegram_event_handlers():
                         date=msg.date or datetime.utcnow(),
                         text=msg.text,
                         processed=False,
-                        analysed_by_ai=False
+                        analysed_by_ai=False,
+                        revision=1
                     )
                     session.add(db_message)
                     session.commit()
                     session.refresh(db_message)
+
+                    record_stage(
+                        stage="MESSAGE_EDIT_NEW_ENTRY",
+                        status="INFO",
+                        message_id=db_message.id,
+                        telegram_message_id=msg.id,
+                        revision=1,
+                        details={"text_snippet": msg.text[:100]},
+                        session=session
+                    )
 
                 # Mirror updated message if mirror channel is configured
                 mirror_channel_id = os.getenv("TELEGRAM_MIRROR_CHANNEL")
@@ -625,8 +755,27 @@ def setup_telegram_event_handlers():
                         try:
                             await client.send_message(mirror_entity, f"✏️ [UPDATED MESSAGE]\n{msg.text}")
                             logger.info(f"Mirrored updated message ID {msg.id}")
+                            record_stage(
+                                stage="MIRROR_UPDATED_MESSAGE",
+                                status="SUCCESS",
+                                message_id=db_message.id,
+                                telegram_message_id=msg.id,
+                                revision=db_message.revision,
+                                details={"mirror_channel": str(mirror_channel_id)},
+                                session=session
+                            )
                         except Exception as me:
                             logger.error(f"Failed to mirror updated message ID {msg.id}: {me}")
+                            record_stage(
+                                stage="MIRROR_UPDATED_MESSAGE_FAILED",
+                                status="WARNING",
+                                message_id=db_message.id,
+                                telegram_message_id=msg.id,
+                                revision=db_message.revision,
+                                error_message=str(me),
+                                details={"mirror_channel": str(mirror_channel_id)},
+                                session=session
+                            )
 
                 # Process the updated message through full flow
                 actions_channel_id = os.getenv("TELEGRAM_ACTIONS_CHANNEL")
@@ -646,12 +795,32 @@ async def process_single_message(session: Session, db_message: Message, actions_
     Returns True if processed successfully, False otherwise.
     """
     session.refresh(db_message)
+    rev = db_message.revision or 0
+
     if db_message.analysed_by_ai:
         logger.info(f"Message ID {db_message.id} (TG ID: {db_message.telegram_message_id}) is already analysed. Skipping.")
+        record_stage(
+            stage="ANALYSIS_CHECK",
+            status="SKIPPED",
+            message_id=db_message.id,
+            telegram_message_id=db_message.telegram_message_id,
+            revision=rev,
+            details={"reason": "Already analysed by AI previously"},
+            session=session
+        )
         return True
 
     if is_poke_message(db_message.text):
         logger.info(f"Message ID {db_message.id} is a poke message ('{db_message.text.strip()}'). Skipping processing.")
+        record_stage(
+            stage="POKE_FILTER",
+            status="SKIPPED",
+            message_id=db_message.id,
+            telegram_message_id=db_message.telegram_message_id,
+            revision=rev,
+            details={"reason": "Poke ping / dot message ignored", "raw_text": db_message.text.strip()},
+            session=session
+        )
         db_message.analysed_by_ai = True
         db_message.processed = True
         db_message.processed_at = datetime.utcnow()
@@ -660,21 +829,57 @@ async def process_single_message(session: Session, db_message: Message, actions_
 
     logger.info(f"Analyzing message ID {db_message.id} (TG ID: {db_message.telegram_message_id or 'N/A'})...")
     
-    # Fetch open trades context and send to Gemini
-    open_trades = get_open_trades_context(session)
-    analysis = analyze_message_with_ai(db_message.text, open_trades)
+    # 1. Fetch open trades context
+    with StageContext("CONTEXT_FETCH", message_id=db_message.id, telegram_message_id=db_message.telegram_message_id, revision=rev, session=session) as ctx:
+        open_trades = get_open_trades_context(session)
+        ctx.set_details({"open_trades_count": len(open_trades), "open_trade_ids": [t["id"] for t in open_trades]})
 
-    if not analysis:
-        logger.error(f"Failed to analyze message ID {db_message.id} with AI. Skipping and keeping it unanalysed for retry.")
+    # 2. AI Analysis via Gemini
+    analysis = None
+    try:
+        with StageContext("AI_ANALYSIS", message_id=db_message.id, telegram_message_id=db_message.telegram_message_id, revision=rev, session=session) as ctx:
+            analysis = analyze_message_with_ai(db_message.text, open_trades)
+            if not analysis:
+                ctx.set_error("Gemini AI analysis returned None")
+                logger.error(f"Failed to analyze message ID {db_message.id} with AI. Skipping and keeping it unanalysed for retry.")
+                return False
+            ctx.set_details({
+                "is_valid_trade_msg": analysis.is_valid_trade_msg,
+                "is_continuation": analysis.is_continuation,
+                "related_open_trade_id": analysis.related_open_trade_id,
+                "underlying": analysis.underlying,
+                "structure_type": analysis.structure_type,
+                "actions_count": len(analysis.actions),
+                "trade_status_update": analysis.trade_status_update,
+                "context_summary": analysis.context_summary
+            })
+    except Exception as ge:
+        logger.error(f"Gemini analysis exception for Message ID {db_message.id}: {ge}")
         return False
 
     db_message.ai_response = json.dumps(analysis.model_dump(), default=str)
     
-    if analysis.is_valid_trade_msg:
-        logger.info(f"Valid trade detected by AI for message ID {db_message.id}.")
-        
-        trade = None
-        # Is it a continuation? Try to find existing open trade
+    if not analysis.is_valid_trade_msg:
+        record_stage(
+            stage="AI_NON_TRADE_MESSAGE",
+            status="SKIPPED",
+            message_id=db_message.id,
+            telegram_message_id=db_message.telegram_message_id,
+            revision=rev,
+            details={"reason": "AI classified as non-trade commentary or informational message", "context_summary": analysis.context_summary},
+            session=session
+        )
+        db_message.analysed_by_ai = True
+        db_message.processed = True
+        db_message.processed_at = datetime.utcnow()
+        session.commit()
+        return True
+
+    logger.info(f"Valid trade detected by AI for message ID {db_message.id}.")
+    trade = None
+
+    # 3. Trade Matching or Creation
+    with StageContext("TRADE_ROUTING", message_id=db_message.id, telegram_message_id=db_message.telegram_message_id, revision=rev, session=session) as ctx:
         if analysis.is_continuation and analysis.related_open_trade_id:
             trade = session.query(Trade).filter(Trade.id == analysis.related_open_trade_id).first()
             if trade:
@@ -703,8 +908,18 @@ async def process_single_message(session: Session, db_message: Message, actions_
             logger.info(f"Trade ID {trade.id} status updated to CLOSED")
         
         session.commit()
+        ctx.set_trade_id(trade.id)
+        ctx.set_details({
+            "trade_id": trade.id,
+            "is_continuation": analysis.is_continuation,
+            "underlying": trade.underlying,
+            "structure_type": trade.structure_type,
+            "status": trade.status
+        })
 
-        # Save Actions and resolve Zerodha instrument details with target budget lot sizing
+    # 4. Instrument Resolution and Budget Lot Sizing
+    db_actions = []
+    with StageContext("INSTRUMENT_RESOLUTION_AND_SIZING", message_id=db_message.id, telegram_message_id=db_message.telegram_message_id, trade_id=trade.id, revision=rev, session=session) as ctx:
         db_actions = process_trade_actions_and_sizing(
             trade=trade,
             db_message_id=db_message.id,
@@ -712,22 +927,52 @@ async def process_single_message(session: Session, db_message: Message, actions_
         )
         for db_action in db_actions:
             session.add(db_action)
-        
         session.commit()
 
-        # If trade is closed or exit action detected, generate square-off actions for any open legs
-        if trade and (analysis.trade_status_update == "CLOSED" or trade.status == "CLOSED" or any(a.action_type in ["EXIT", "CLOSE_LEG"] for a in analysis.actions)):
+        unresolved = [a.instrument_name or a.action_type for a in db_actions if not a.tradingsymbol]
+        if unresolved:
+            ctx.set_warning(f"Could not resolve NFO tradingsymbol for: {', '.join(unresolved)}")
+
+        ctx.set_details({
+            "actions_count": len(db_actions),
+            "legs": [
+                {
+                    "action_id": a.id,
+                    "action_type": a.action_type,
+                    "symbol": a.tradingsymbol,
+                    "is_main": a.is_main,
+                    "quantity": a.quantity,
+                    "lots": a.lots,
+                    "price": a.price
+                }
+                for a in db_actions
+            ]
+        })
+
+    # 5. Automatic Square-Off Generation for exits / closed trades
+    if trade and (analysis.trade_status_update == "CLOSED" or trade.status == "CLOSED" or any(a.action_type in ["EXIT", "CLOSE_LEG"] for a in analysis.actions)):
+        with StageContext("SQUARE_OFF_GENERATION", message_id=db_message.id, telegram_message_id=db_message.telegram_message_id, trade_id=trade.id, revision=rev, session=session) as ctx:
             sq_actions = ensure_square_off_actions(session, trade, db_message, analysis.actions)
             for sq_a in sq_actions:
                 if sq_a not in db_actions:
                     db_actions.append(sq_a)
+            ctx.set_details({
+                "square_off_actions_count": len(sq_actions),
+                "legs": [f"{a.transaction_type} {a.quantity} x {a.tradingsymbol}" for a in sq_actions]
+            })
 
-        # Automatically execute pending orders if auto-placement flags are active
+    # 6. Automatic Order Placement Check
+    with StageContext("ORDER_EXECUTION", message_id=db_message.id, telegram_message_id=db_message.telegram_message_id, trade_id=trade.id, revision=rev, session=session) as ctx:
         logger.info(f"Running automated order placement check for Trade ID {trade.id}...")
-        execute_trade_actions(session, trade.id, auto_mode=True)
+        exec_results = execute_trade_actions(session, trade.id, auto_mode=True)
+        failed_orders = [r for r in exec_results if not r.get("success")]
+        if failed_orders:
+            ctx.set_warning(f"{len(failed_orders)} orders failed: {', '.join(r.get('message', '') for r in failed_orders)}")
+        ctx.set_details({"results": exec_results, "auto_mode": True})
 
-        # Send formatted message to actions channel
-        if actions_entity and db_actions:
+    # 7. Action Notification to Telegram
+    if actions_entity and db_actions:
+        with StageContext("TELEGRAM_NOTIFICATION", message_id=db_message.id, telegram_message_id=db_message.telegram_message_id, trade_id=trade.id, revision=rev, session=session) as ctx:
             try:
                 session.refresh(trade)
                 for a in db_actions:
@@ -752,13 +997,26 @@ async def process_single_message(session: Session, db_message: Message, actions_
                     a.telegram_sent = True
                 session.commit()
                 logger.info(f"Action notifications sent to Telegram for Trade ID {trade.id}")
+                ctx.set_details({"has_pending_orders": has_pending_orders, "actions_notified": len(db_actions)})
             except Exception as ae:
                 logger.error(f"Failed to send actions notification: {ae}")
+                ctx.set_error(str(ae))
 
     db_message.analysed_by_ai = True
     db_message.processed = True
     db_message.processed_at = datetime.utcnow()
     session.commit()
+
+    record_stage(
+        stage="MESSAGE_COMPLETED",
+        status="SUCCESS",
+        message_id=db_message.id,
+        telegram_message_id=db_message.telegram_message_id,
+        trade_id=trade.id if trade else None,
+        revision=rev,
+        details={"trade_id": trade.id if trade else None, "actions_count": len(db_actions) if 'db_actions' in locals() else 0},
+        session=session
+    )
     return True
 
 async def sync_and_process():
@@ -818,6 +1076,17 @@ async def sync_and_process():
                 )
                 session.add(db_message)
                 session.commit()
+                session.refresh(db_message)
+
+                record_stage(
+                    stage="POKE_FILTER",
+                    status="SKIPPED",
+                    message_id=db_message.id,
+                    telegram_message_id=msg.id,
+                    revision=0,
+                    details={"reason": "Poke notification ping, not a trade recommendation", "raw_text": msg.text.strip()},
+                    session=session
+                )
                 continue
 
             logger.info(f"Syncing new message ID {msg.id}: {msg.text[:50]}...")
@@ -829,19 +1098,49 @@ async def sync_and_process():
                 date=msg.date,
                 text=msg.text,
                 processed=False,
-                analysed_by_ai=False
+                analysed_by_ai=False,
+                revision=0
             )
             session.add(db_message)
             session.commit()
             session.refresh(db_message)
+
+            record_stage(
+                stage="SYNC_RECEIVED",
+                status="SUCCESS",
+                message_id=db_message.id,
+                telegram_message_id=msg.id,
+                revision=0,
+                details={"source_channel": str(source_channel_id), "date": str(msg.date), "text_snippet": msg.text[:80]},
+                session=session
+            )
 
             # 2. Mirror raw message
             if mirror_entity:
                 try:
                     await client.send_message(mirror_entity, msg.text)
                     logger.info(f"Mirrored message ID {msg.id}")
+                    record_stage(
+                        stage="MIRROR_FORWARDED",
+                        status="SUCCESS",
+                        message_id=db_message.id,
+                        telegram_message_id=msg.id,
+                        revision=0,
+                        details={"mirror_channel": str(mirror_channel_id)},
+                        session=session
+                    )
                 except Exception as me:
                     logger.error(f"Failed to mirror message ID {msg.id}: {me}")
+                    record_stage(
+                        stage="MIRROR_FORWARD_FAILED",
+                        status="WARNING",
+                        message_id=db_message.id,
+                        telegram_message_id=msg.id,
+                        revision=0,
+                        error_message=str(me),
+                        details={"mirror_channel": str(mirror_channel_id)},
+                        session=session
+                    )
 
         # 3. Process all unanalysed messages in chronological order
         unanalysed_messages = session.query(Message).filter(Message.analysed_by_ai == False).order_by(Message.id.asc()).all()
