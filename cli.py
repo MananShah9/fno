@@ -457,11 +457,16 @@ def manage_config_menu():
         print(f"15. AUTO_PLACE_ORDERS:        {cfg['AUTO_PLACE_ORDERS']}")
         print(f"16. AUTO_PLACE_EXIT_ORDERS:   {cfg['AUTO_PLACE_EXIT_ORDERS']}")
         print(f"17. TARGET_INVESTMENT_BUDGET: Rs. {cfg.get('TARGET_INVESTMENT_BUDGET', '100000')}")
-        print(f"18. LOG_LEVEL:               {cfg.get('LOG_LEVEL', 'INFO')}")
-        print(f"19. 🔙 Return to Main Menu")
+        print(f"18. MAX_STOCK_LOTS:          {cfg.get('MAX_STOCK_LOTS', '2')} lots")
+        print(f"19. MAX_INDEX_LOTS:          {cfg.get('MAX_INDEX_LOTS', '4')} lots")
+        print(f"20. EST_INDEX_SPREAD_MARGIN: Rs. {cfg.get('ESTIMATED_INDEX_SPREAD_MARGIN', '40000')}")
+        print(f"21. EST_STOCK_SPREAD_MARGIN: Rs. {cfg.get('ESTIMATED_STOCK_SPREAD_MARGIN', '120000')}")
+        print(f"22. EST_FUTURES_MARGIN:      Rs. {cfg.get('ESTIMATED_INDEX_FUTURES_MARGIN', '130000')}")
+        print(f"23. LOG_LEVEL:               {cfg.get('LOG_LEVEL', 'INFO')}")
+        print(f"24. 🔙 Return to Main Menu")
         
-        choice = input("\nSelect setting to edit (1-19): ").strip()
-        if choice == '19':
+        choice = input("\nSelect setting to edit (1-24): ").strip()
+        if choice == '24':
             break
             
         env_map = {
@@ -482,7 +487,12 @@ def manage_config_menu():
             '15': 'AUTO_PLACE_ORDERS',
             '16': 'AUTO_PLACE_EXIT_ORDERS',
             '17': 'TARGET_INVESTMENT_BUDGET',
-            '18': 'LOG_LEVEL'
+            '18': 'MAX_STOCK_LOTS',
+            '19': 'MAX_INDEX_LOTS',
+            '20': 'ESTIMATED_INDEX_SPREAD_MARGIN',
+            '21': 'ESTIMATED_STOCK_SPREAD_MARGIN',
+            '22': 'ESTIMATED_INDEX_FUTURES_MARGIN',
+            '23': 'LOG_LEVEL'
         }
         
         if choice in env_map:

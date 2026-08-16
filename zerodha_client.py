@@ -351,3 +351,73 @@ def place_zerodha_order(
             "order_id": None,
             "message": str(e)
         }
+
+
+def calculate_basket_margin(
+    order_params_list: List[Dict[str, Any]],
+    consider_positions: bool = False
+) -> Optional[float]:
+    """
+    Calculates total margin required for a list of orders (basket) using Zerodha Kite Connect API.
+    Handles SPAN + Exposure margin relief for hedged multi-leg positions.
+    Returns float total required margin in INR, or None if the API call fails or is unavailable.
+    """
+    if not order_params_list:
+        return None
+    try:
+        kite = get_zerodha_client()
+        formatted_orders = []
+        for o in order_params_list:
+            tt = str(o.get("transaction_type", "BUY")).strip().upper()
+            ot = str(o.get("order_type", "MARKET")).strip().upper()
+            prod = str(o.get("product", "NRML")).strip().upper()
+            
+            tt_val = getattr(kite, f"TRANSACTION_TYPE_{tt}", tt)
+            ot_val = getattr(kite, f"ORDER_TYPE_{ot}", ot)
+            prod_val = getattr(kite, f"PRODUCT_{prod}", prod)
+            variety_val = getattr(kite, "VARIETY_REGULAR", "regular")
+
+            formatted_orders.append({
+                "exchange": o.get("exchange", "NFO"),
+                "tradingsymbol": str(o.get("tradingsymbol", "")).strip().upper(),
+                "transaction_type": tt_val,
+                "variety": variety_val,
+                "product": prod_val,
+                "order_type": ot_val,
+                "quantity": int(o.get("quantity", 1)),
+                "price": float(o.get("price", 0.0)) if o.get("price") else 0.0,
+                "trigger_price": float(o.get("trigger_price", 0.0)) if o.get("trigger_price") else 0.0
+            })
+
+        # Try basket_margins first (provides hedged margin calculation)
+        if hasattr(kite, "basket_margins"):
+            try:
+                res = kite.basket_margins(formatted_orders, consider_positions=consider_positions)
+                if res and isinstance(res, dict):
+                    # 'final' total includes hedge benefits across legs
+                    final_info = res.get("final") or {}
+                    initial_info = res.get("initial") or {}
+                    total_m = final_info.get("total") or initial_info.get("total")
+                    if total_m is not None and float(total_m) > 0:
+                        logger.info(f"Zerodha Basket Margin calculated: Rs. {float(total_m):,.2f} for {len(formatted_orders)} legs")
+                        return float(total_m)
+            except Exception as b_err:
+                logger.warning(f"kite.basket_margins call failed: {b_err}")
+
+        # Fallback to order_margins
+        if hasattr(kite, "order_margins"):
+            try:
+                res = kite.order_margins(formatted_orders)
+                if res and isinstance(res, list):
+                    total_m = sum(float(item.get("total", 0.0)) for item in res if isinstance(item, dict))
+                    if total_m > 0:
+                        logger.info(f"Zerodha Order Margins calculated: Rs. {total_m:,.2f}")
+                        return total_m
+            except Exception as o_err:
+                logger.warning(f"kite.order_margins call failed: {o_err}")
+
+    except Exception as e:
+        logger.warning(f"Zerodha margin API calculation unavailable: {e}")
+
+    return None
+

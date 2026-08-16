@@ -34,6 +34,14 @@ def load_config():
         "AUTO_PLACE_ORDERS": os.getenv("AUTO_PLACE_ORDERS", "false").lower() in ("true", "1", "t", "yes"),
         "AUTO_PLACE_EXIT_ORDERS": os.getenv("AUTO_PLACE_EXIT_ORDERS", "false").lower() in ("true", "1", "t", "yes"),
         "TARGET_INVESTMENT_BUDGET": os.getenv("TARGET_INVESTMENT_BUDGET", "100000"),
+        "MAX_STOCK_LOTS": os.getenv("MAX_STOCK_LOTS", "2"),
+        "MAX_INDEX_LOTS": os.getenv("MAX_INDEX_LOTS", "4"),
+        "ESTIMATED_INDEX_SPREAD_MARGIN": os.getenv("ESTIMATED_INDEX_SPREAD_MARGIN", "40000"),
+        "ESTIMATED_STOCK_SPREAD_MARGIN": os.getenv("ESTIMATED_STOCK_SPREAD_MARGIN", "120000"),
+        "ESTIMATED_INDEX_FUTURES_MARGIN": os.getenv("ESTIMATED_INDEX_FUTURES_MARGIN", "130000"),
+        "ESTIMATED_STOCK_FUTURES_MARGIN": os.getenv("ESTIMATED_STOCK_FUTURES_MARGIN", "200000"),
+        "ESTIMATED_INDEX_SHORT_OPTION_MARGIN": os.getenv("ESTIMATED_INDEX_SHORT_OPTION_MARGIN", "130000"),
+        "ESTIMATED_STOCK_SHORT_OPTION_MARGIN": os.getenv("ESTIMATED_STOCK_SHORT_OPTION_MARGIN", "200000"),
         "LOG_LEVEL": os.getenv("LOG_LEVEL", "INFO").upper(),
     }
 

@@ -12,8 +12,15 @@ import db
 from models import Message, Trade, Action
 from telegram_client import client, check_login, get_channel_entity
 from gemini_client import analyze_message_with_ai, clean_symbol, is_poke_message
-from instruments_manager import resolve_nfo_instrument, parse_price_value, calculate_lots_from_budget
-from zerodha_client import place_zerodha_order, check_existing_zerodha_order_or_position, get_nfo_ltp
+from instruments_manager import (
+    resolve_nfo_instrument, parse_price_value, calculate_lots_from_budget,
+    calculate_position_size, classify_strategy_type, get_margin_tier_estimate,
+    get_max_lot_cap, is_index_symbol
+)
+from zerodha_client import (
+    place_zerodha_order, check_existing_zerodha_order_or_position, get_nfo_ltp,
+    calculate_basket_margin
+)
 from stage_tracker import record_stage, StageContext, get_code_location
 from time_filter import is_telegram_time_active, get_schedule_description
 
@@ -316,23 +323,67 @@ def process_trade_actions_and_sizing(
             except Exception as le:
                 logger.warning(f"Failed to fetch live LTP for {main_inst.get('tradingsymbol')}: {le}")
 
-        # 3. Calculate lots for main leg
-        calculated_lots = calculate_lots_from_budget(main_price, main_lot_size, target_budget)
+        # 3. Check for live Zerodha Margin via Basket Margin API for multi-leg / short / futures orders
+        live_margin = None
+        entry_legs_list = [resolved_items[i] for i in entry_indices]
+        strat_type = classify_strategy_type(entry_legs_list, main_item["underlying"])
+
+        if strat_type in ["SPREAD", "SINGLE_FUTURES", "NAKED_SHORT_OPTION"]:
+            margin_order_params = []
+            for item in entry_legs_list:
+                leg_inst = item["inst"]
+                if leg_inst and leg_inst.get("tradingsymbol"):
+                    leg_price = parse_price_value(getattr(item["schema"], "price", None)) or 0.0
+                    tt = getattr(item["schema"], "transaction_type", None) or item["action_type"]
+                    if tt not in ["BUY", "SELL"]:
+                        tt = "BUY" if item["action_type"] == "BUY" else "SELL"
+                    margin_order_params.append({
+                        "exchange": leg_inst.get("exchange", "NFO"),
+                        "tradingsymbol": leg_inst.get("tradingsymbol"),
+                        "transaction_type": tt,
+                        "variety": "regular",
+                        "product": getattr(item["schema"], "product", None) or "NRML",
+                        "order_type": "LIMIT" if leg_price > 0 else "MARKET",
+                        "quantity": leg_inst.get("lot_size", 1),
+                        "price": leg_price
+                    })
+
+            if margin_order_params:
+                try:
+                    live_margin = calculate_basket_margin(margin_order_params)
+                except Exception as me:
+                    logger.warning(f"Error querying live Zerodha basket margin: {me}")
+
+        # 4. Calculate lots and sizing via margin-based engine
+        sizing_result = calculate_position_size(
+            entry_legs=entry_legs_list,
+            target_budget=target_budget,
+            underlying=main_item["underlying"],
+            live_margin=live_margin,
+            main_price=main_price
+        )
+
+        calculated_lots = sizing_result["lots"]
         main_quantity = calculated_lots * main_lot_size
 
         logger.info(
-            f"Trade #{trade.id if trade else 'N/A'} Target Budget Sizing: "
-            f"budget={target_budget}, main_price={main_price}, lot_size={main_lot_size} -> "
-            f"lots={calculated_lots}, main_qty={main_quantity}"
+            f"Trade #{trade.id if trade else 'N/A'} Margin Sizing Result: "
+            f"underlying={main_item['underlying']} (Index={sizing_result['is_index']}), "
+            f"strategy={sizing_result['strategy_type']}, method={sizing_result['sizing_method']}, "
+            f"budget=Rs.{target_budget or 0:,.2f}, per_lot_capital=Rs.{sizing_result['per_lot_capital']:,.2f}, "
+            f"raw_lots={sizing_result['raw_lots']:.2f}, max_cap={sizing_result['max_lot_cap']} -> "
+            f"final_lots={calculated_lots}, main_qty={main_quantity}"
         )
 
-        # 4. Set sizing and role for all entry legs
+        # 5. Set sizing and role for all entry legs
         for i in entry_indices:
             is_this_main = (i == main_idx)
+            leg_inst = resolved_items[i]["inst"]
+            leg_lot_size = leg_inst["lot_size"] if leg_inst else main_lot_size
             resolved_items[i]["is_main"] = is_this_main
             resolved_items[i]["lots"] = calculated_lots
-            # "hedge qty will be always same as main qty"
-            resolved_items[i]["quantity"] = main_quantity
+            # Assign quantity based on leg lot size and calculated lots
+            resolved_items[i]["quantity"] = calculated_lots * leg_lot_size
 
     # For exit legs directly in message, try to match existing open legs
     for idx, item in enumerate(resolved_items):
