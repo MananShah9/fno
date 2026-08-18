@@ -374,6 +374,9 @@ def view_trade_details(trade_id: int, session: Session):
     print(f"STATUS:          {trade.status}")
     print(f"Underlying:      {trade.underlying or 'N/A'}")
     print(f"Strategy Type:   {trade.structure_type or 'N/A'}")
+    print(f"Adjustments:     {trade.adjustment_count or 0}/{trade.max_adjustments if trade.max_adjustments is not None else 1}")
+    if trade.last_adjustment_at:
+        print(f"Last Adjustment: {trade.last_adjustment_at} (Price: {trade.last_adjustment_price or 'N/A'})")
     print(f"Opened At:       {trade.opened_at}")
     if trade.closed_at:
         print(f"Closed At:       {trade.closed_at}")
@@ -387,6 +390,8 @@ def view_trade_details(trade_id: int, session: Session):
         actions_data = []
         for act in actions:
             role = "Main" if getattr(act, "is_main", True) else "Hedge"
+            if getattr(act, "is_adjustment", False):
+                role = f"Adj #{act.adjustment_number or 1}"
             qty_str = f"{act.quantity} ({act.lots or 1}L)" if act.quantity else "N/A"
             actions_data.append([
                 act.id,
@@ -415,6 +420,8 @@ def view_all_actions():
             table_data = []
             for act in actions:
                 role = "Main" if getattr(act, "is_main", True) else "Hedge"
+                if getattr(act, "is_adjustment", False):
+                    role = f"Adj #{act.adjustment_number or 1}"
                 qty_str = f"{act.quantity} ({act.lots or 1}L)" if act.quantity else "N/A"
                 table_data.append([
                     act.id,
@@ -459,14 +466,16 @@ def manage_config_menu():
         print(f"17. TARGET_INVESTMENT_BUDGET: Rs. {cfg.get('TARGET_INVESTMENT_BUDGET', '100000')}")
         print(f"18. MAX_STOCK_LOTS:          {cfg.get('MAX_STOCK_LOTS', '2')} lots")
         print(f"19. MAX_INDEX_LOTS:          {cfg.get('MAX_INDEX_LOTS', '4')} lots")
-        print(f"20. EST_INDEX_SPREAD_MARGIN: Rs. {cfg.get('ESTIMATED_INDEX_SPREAD_MARGIN', '40000')}")
-        print(f"21. EST_STOCK_SPREAD_MARGIN: Rs. {cfg.get('ESTIMATED_STOCK_SPREAD_MARGIN', '120000')}")
-        print(f"22. EST_FUTURES_MARGIN:      Rs. {cfg.get('ESTIMATED_INDEX_FUTURES_MARGIN', '130000')}")
-        print(f"23. LOG_LEVEL:               {cfg.get('LOG_LEVEL', 'INFO')}")
-        print(f"24. 🔙 Return to Main Menu")
+        print(f"20. MAX_ADJUSTMENTS_PER_TRADE: {cfg.get('MAX_ADJUSTMENTS_PER_TRADE', '1')}")
+        print(f"21. ADJ_DEDUP_WINDOW_MINS:   {cfg.get('ADJUSTMENT_DEDUPLICATION_WINDOW_MINUTES', '30')} mins")
+        print(f"22. ADJUSTMENT_MAX_LOTS:     {cfg.get('ADJUSTMENT_MAX_LOTS', '1')} lot(s)")
+        print(f"23. EST_INDEX_SPREAD_MARGIN: Rs. {cfg.get('ESTIMATED_INDEX_SPREAD_MARGIN', '40000')}")
+        print(f"24. EST_STOCK_SPREAD_MARGIN: Rs. {cfg.get('ESTIMATED_STOCK_SPREAD_MARGIN', '120000')}")
+        print(f"25. LOG_LEVEL:               {cfg.get('LOG_LEVEL', 'INFO')}")
+        print(f"26. 🔙 Return to Main Menu")
         
-        choice = input("\nSelect setting to edit (1-24): ").strip()
-        if choice == '24':
+        choice = input("\nSelect setting to edit (1-26): ").strip()
+        if choice == '26':
             break
             
         env_map = {
@@ -489,10 +498,12 @@ def manage_config_menu():
             '17': 'TARGET_INVESTMENT_BUDGET',
             '18': 'MAX_STOCK_LOTS',
             '19': 'MAX_INDEX_LOTS',
-            '20': 'ESTIMATED_INDEX_SPREAD_MARGIN',
-            '21': 'ESTIMATED_STOCK_SPREAD_MARGIN',
-            '22': 'ESTIMATED_INDEX_FUTURES_MARGIN',
-            '23': 'LOG_LEVEL'
+            '20': 'MAX_ADJUSTMENTS_PER_TRADE',
+            '21': 'ADJUSTMENT_DEDUPLICATION_WINDOW_MINUTES',
+            '22': 'ADJUSTMENT_MAX_LOTS',
+            '23': 'ESTIMATED_INDEX_SPREAD_MARGIN',
+            '24': 'ESTIMATED_STOCK_SPREAD_MARGIN',
+            '25': 'LOG_LEVEL'
         }
         
         if choice in env_map:

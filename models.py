@@ -39,12 +39,19 @@ class Trade(Base):
     closed_at = Column(DateTime, nullable=True)
     context_summary = Column(Text, nullable=True)         # Short details about the trade for LLM context
 
+    # Trade Adjustment & Averaging Lifecycle State
+    max_adjustments = Column(Integer, default=1)          # Maximum allowed averaging adjustments
+    adjustment_count = Column(Integer, default=0)         # Number of approved/executed adjustments
+    last_adjustment_at = Column(DateTime, nullable=True)  # Timestamp of last adjustment
+    last_adjustment_price = Column(Float, nullable=True)  # Reference/fill price of last adjustment
+    last_adjustment_strike = Column(Float, nullable=True) # Strike price of last adjustment
+
     # Relationships
     actions = relationship("Action", back_populates="trade")
     stage_traces = relationship("MessageStageTrace", back_populates="trade")
 
     def __repr__(self):
-        return f"<Trade(id={self.id}, status={self.status}, underlying={self.underlying}, type={self.structure_type})>"
+        return f"<Trade(id={self.id}, status={self.status}, underlying={self.underlying}, type={self.structure_type}, adj_count={self.adjustment_count}/{self.max_adjustments})>"
 
 
 class Action(Base):
@@ -64,6 +71,8 @@ class Action(Base):
 
     # Zerodha Execution Parameters
     is_main = Column(Boolean, default=True)           # True if main/primary leg, False if hedge leg
+    is_adjustment = Column(Boolean, default=False)    # True if averaging/adjustment leg
+    adjustment_number = Column(Integer, nullable=True)# Index of adjustment (1 for 1st averaging, etc.)
     underlying = Column(String, nullable=True)
     option_type = Column(String, nullable=True)
     strike = Column(Float, nullable=True)

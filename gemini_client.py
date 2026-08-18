@@ -70,6 +70,7 @@ class ActionSchema(BaseModel):
     action_type: str = Field(description="Must be one of: BUY, SELL, EXIT, UPDATE_SL, CLOSE_LEG, INFO")
     transaction_type: Optional[str] = Field(description="Zerodha order side: 'BUY' or 'SELL'. For entry: 'BUY' or 'SELL'. For EXIT: if exiting/closing a short position it is 'BUY'; if exiting/closing a long position it is 'SELL'.")
     is_main: Optional[bool] = Field(description="True if this is the primary/main directional leg of the trade, False if it is a hedge leg.")
+    is_adjustment: Optional[bool] = Field(description="True if this action represents an averaging or adjustment leg on an existing open trade. False for initial trade entries.")
     underlying: Optional[str] = Field(description="Underlying index or stock symbol ONLY in uppercase, e.g. 'NIFTY', 'BANKNIFTY', 'VBL', 'INDIGO', 'RELIANCE', 'TATASTEEL'. Do NOT include any explanations, reasoning, or 'REF' suffixes.")
     option_type: Optional[str] = Field(description="Instrument option type: 'CE', 'PE', or 'FUT'")
     strike: Optional[float] = Field(description="Numeric strike price if option, e.g. 24000, 23600, 480, 5300, 192.5. Null for Futures.")
@@ -89,6 +90,7 @@ class ActionSchema(BaseModel):
             "action_type": "INFO",
             "transaction_type": None,
             "is_main": True,
+            "is_adjustment": False,
             "underlying": None,
             "option_type": None,
             "strike": None,
@@ -109,8 +111,10 @@ class ActionSchema(BaseModel):
         super().__init__(**data)
 
 class TradeAnalysisSchema(BaseModel):
-    is_valid_trade_msg: bool = Field(description="True if this message represents a valid trade setup, entry, modification, stoploss update, target update, or exit/close alert. False if it is general talk, FYI, or unrelated.")
+    is_valid_trade_msg: bool = Field(description="True if this message represents a valid trade setup, entry, modification, stoploss update, target update, averaging/adjustment alert, or exit/close alert. False if it is general talk, FYI, or unrelated.")
     is_continuation: bool = Field(description="True if this message updates, adds lots to, or closes a trade from the provided 'Open Trades Context'.")
+    is_adjustment: bool = Field(description="True if this message discusses or executes an adjustment or averaging event on an existing open trade.")
+    is_adjustment_reminder: bool = Field(description="True if this message is merely a status update, reminder, planning commentary, or ongoing discussion of an active averaging window (e.g. 'We are planning to average at 241', 'Start averaging', 'Average around 235-241', 'If you missed it, add in 220s', 'Average done') rather than a brand-new distinct additional lot instruction.")
     related_open_trade_id: Optional[int] = Field(description="The 'id' of the related open trade from the provided 'Open Trades Context', if is_continuation is True.")
     structure_type: Optional[str] = Field(description="The overall strategy structure, e.g., 'TATASTEEL BULL PUT SPREAD', 'NIFTY PE SPREAD', 'INDIGO BEAR CALL SPREAD', 'SINGLE CE BUY'.")
     underlying: Optional[str] = Field(description="Underlying ticker symbol ONLY in uppercase, e.g. 'TATASTEEL', 'NIFTY', 'VBL', 'INDIGO', 'BANKNIFTY'. ABSOLUTELY NO reasoning, markdown, or 'REF' suffixes.")
@@ -122,6 +126,8 @@ class TradeAnalysisSchema(BaseModel):
         defaults = {
             "is_valid_trade_msg": False,
             "is_continuation": False,
+            "is_adjustment": False,
+            "is_adjustment_reminder": False,
             "related_open_trade_id": None,
             "structure_type": None,
             "underlying": None,
@@ -152,10 +158,14 @@ CRITICAL CONSTRAINTS:
 4. Order Types & Prices:
    - If a price range, limit price, or level is specified (e.g. "@ Range (4.5-4.7)", "@ 98-110", "@ 220s", "above 200", "near 100", "Close 24600 at 93"), set `order_type = 'LIMIT'`, `is_limit = True`, and extract `price`.
    - If no price is given or execution is CMP / Market / immediate, set `order_type = 'MARKET'`.
-5. Continuation, Leg Updates, Averaging, and Follow-ups:
+5. Continuation, Leg Updates, Averaging, and Follow-ups (Conversational Adjustment Context):
    - When a message provides specific strikes/legs for a previously announced strategy (e.g. after 'Deploy Bear Call Spread' followed by 'Sell 23950 CE Buy 24250 CE'), set `is_valid_trade_msg = True`, `is_continuation = True`, and `related_open_trade_id` to that open trade.
-   - When a message instructs averaging/adding a lot (e.g. 'We will sell 24050 PE at 520-550', 'add that lot in 220s'), set `is_valid_trade_msg = True`, `is_continuation = True`, and `related_open_trade_id` to the matching open trade.
-   - When a message updates target or stoploss for an existing leg, set `is_valid_trade_msg = True`, `is_continuation = True`, and `related_open_trade_id` to the matching open trade.
+   - DIFFERENTIATING AVERAGING ORDERS VS. STATUS/REMINDER COMMENTARY:
+     * When a signal provider first instructs adding an averaging lot (e.g., 'We will sell 24050 PE at 520-550', 'Add 1 lot of 24000 PE at 240'):
+       Set `is_valid_trade_msg = True`, `is_continuation = True`, `is_adjustment = True`, `is_adjustment_reminder = False`, `related_open_trade_id` to matching open trade, and extract the adjustment leg into `actions` with `is_adjustment = True`.
+     * When subsequent or related messages provide status updates, planning commentary, ongoing execution guidance, or reminders for the SAME averaging window (e.g., "We are planning to average at 241", "Start averaging", "Average around 235-241", "If you missed it, add in 220s", "We averaged earlier", "Average done", "Hold average position"):
+       Set `is_valid_trade_msg = True`, `is_continuation = True`, `is_adjustment = True`, `is_adjustment_reminder = True`, and `related_open_trade_id` to the matching open trade. If the message is a status check or reminder of the same averaging window, set `action_type = 'INFO'` or set `is_adjustment = True` so downstream state machine prevents duplicate lot creation.
+   - When a message updates target or stoploss for an existing leg, set `is_valid_trade_msg = True`, `is_continuation = True`, `related_open_trade_id` to the matching open trade, and `action_type = 'UPDATE_SL'`.
 6. Trade Exits and Profit Booking:
    - When an alert instructs to close/exit or book profit (e.g. "SL hit Exit full position", "Close full position", "Close future position at ... All call at ... We are closing the trade", "PROFIT BOOKING IN THIS TRADE Close [strike] Sell leg Close [strike] Hedge leg", "Exit 24000 PE at 90", "Book 24150 PE at 35-36"):
      - Set `is_valid_trade_msg = True`, `is_continuation = True`, and `related_open_trade_id` to the matching open trade from Open Trades Context.
@@ -271,6 +281,10 @@ INSTRUCTIONS:
             result_json["actions"] = []
         if "is_continuation" not in result_json or result_json["is_continuation"] is None:
             result_json["is_continuation"] = False
+        if "is_adjustment" not in result_json or result_json["is_adjustment"] is None:
+            result_json["is_adjustment"] = False
+        if "is_adjustment_reminder" not in result_json or result_json["is_adjustment_reminder"] is None:
+            result_json["is_adjustment_reminder"] = False
         if "trade_status_update" not in result_json or result_json["trade_status_update"] is None:
             result_json["trade_status_update"] = "OPEN"
         if "is_valid_trade_msg" not in result_json or result_json["is_valid_trade_msg"] is None:
@@ -303,6 +317,8 @@ INSTRUCTIONS:
                         act["lots"] = 1
                     if "is_main" not in act or act["is_main"] is None:
                         act["is_main"] = True
+                    if "is_adjustment" not in act or act["is_adjustment"] is None:
+                        act["is_adjustment"] = False
 
         return TradeAnalysisSchema(**result_json)
 

@@ -3,6 +3,7 @@ import asyncio
 import logging
 import sys
 import json
+from typing import Optional, Dict, Any, List, Union
 from datetime import datetime
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
@@ -19,7 +20,7 @@ from instruments_manager import (
 )
 from zerodha_client import (
     place_zerodha_order, check_existing_zerodha_order_or_position, get_nfo_ltp,
-    calculate_basket_margin
+    calculate_basket_margin, verify_zerodha_order_confirmation, get_zerodha_order_status
 )
 from stage_tracker import record_stage, StageContext, get_code_location
 from time_filter import is_telegram_time_active, get_schedule_description
@@ -54,6 +55,9 @@ def get_open_trades_context(session: Session):
                 "instrument_name": action.instrument_name,
                 "tradingsymbol": action.tradingsymbol,
                 "transaction_type": action.transaction_type,
+                "is_adjustment": getattr(action, "is_adjustment", False) or False,
+                "lots": action.lots,
+                "quantity": action.quantity,
                 "price": action.price,
                 "stoploss": action.stoploss,
                 "target": action.target,
@@ -69,19 +73,303 @@ def get_open_trades_context(session: Session):
             "underlying": clean_u,
             "opened_at": trade.opened_at.isoformat() if trade.opened_at else None,
             "context_summary": summary,
+            "adjustment_count": trade.adjustment_count or 0,
+            "max_adjustments": trade.max_adjustments if trade.max_adjustments is not None else 1,
+            "last_adjustment_at": trade.last_adjustment_at.isoformat() if trade.last_adjustment_at else None,
+            "last_adjustment_price": trade.last_adjustment_price,
             "existing_orders": actions_list
         })
     return context
+
+def is_adjustment_planning_text(text: Optional[str]) -> bool:
+    """Checks if message is forward-looking planning commentary (e.g. 'planning to average')."""
+    if not text:
+        return False
+    t = text.lower().strip()
+    planning_phrases = [
+        "planning to average", "plan to average", "thinking to average",
+        "we might average", "plan is to average", "will plan to average"
+    ]
+    return any(p in t for p in planning_phrases)
+
+def is_adjustment_reminder_text(text: Optional[str]) -> bool:
+    """Checks if message is reminder/commentary on an already ongoing or completed averaging window."""
+    if not text:
+        return False
+    t = text.lower().strip()
+    reminder_phrases = [
+        "average around", "if you missed it", "add in 220", "add in 230", "add in 240",
+        "add that lot", "averaged earlier", "average done", "hold average",
+        "keep holding average", "holding average", "we have averaged", "already averaged",
+        "if not averaged", "those who missed", "average here", "averaging at"
+    ]
+    return any(p in t for p in reminder_phrases)
+
+def evaluate_and_deduplicate_adjustments(
+    session: Session,
+    trade: Trade,
+    db_message: Message,
+    analysis: Any,
+    rev: int = 0
+) -> bool:
+    """
+    Evaluates whether the incoming message is an averaging/adjustment attempt on an existing open trade.
+    Enforces the Trade Adjustment Lifecycle State Machine:
+      1. Differentiates conversational planning/status/reminder commentary vs explicit new execution instructions.
+      2. Enforces trade.max_adjustments limit per trade.
+      3. Performs rolling time window (e.g. 30 mins) & pending order deduplication for same trade/strike.
+      4. If approved, increments trade.adjustment_count, updates last_adjustment_at/price/strike,
+         and marks parsed actions with is_adjustment=True and adjustment_number.
+    Returns True if an adjustment was processed/evaluated, False if this is not an adjustment message.
+    """
+    if not trade or trade.status != "OPEN":
+        return False
+
+    # Check if there are actionable entry legs in analysis
+    entry_actions = [a for a in analysis.actions if getattr(a, "action_type", "").upper() in ["BUY", "SELL"]]
+    if not entry_actions:
+        return False
+
+    # Check if trade already has existing entry actions in DB (meaning new entry legs are adjustments/averaging)
+    existing_entries = session.query(Action).filter(
+        Action.trade_id == trade.id,
+        Action.action_type.in_(["BUY", "SELL"])
+    ).count()
+
+    is_adj = bool(
+        getattr(analysis, "is_adjustment", False) or
+        any(getattr(a, "is_adjustment", False) for a in analysis.actions) or
+        (getattr(analysis, "is_continuation", False) and existing_entries > 0) or
+        (existing_entries > 0 and trade.status == "OPEN")
+    )
+
+    if not is_adj:
+        return False
+
+    max_allowed = trade.max_adjustments if trade.max_adjustments is not None else int(os.getenv("MAX_ADJUSTMENTS_PER_TRADE", "1"))
+    window_minutes = float(os.getenv("ADJUSTMENT_DEDUPLICATION_WINDOW_MINUTES", "30"))
+    max_adj_lots = int(os.getenv("ADJUSTMENT_MAX_LOTS", "1"))
+    msg_date = db_message.date or datetime.utcnow()
+    current_adj_count = trade.adjustment_count or 0
+
+    # 1. Check if message is forward-looking planning commentary (e.g. "We are planning to average at 241")
+    if is_adjustment_planning_text(db_message.text):
+        logger.info(f"Message ID {db_message.id} identified as adjustment planning commentary for Trade #{trade.id}.")
+        for a in analysis.actions:
+            if getattr(a, "action_type", "").upper() in ["BUY", "SELL"]:
+                a.action_type = "INFO"
+                a.details = f"Adjustment planning commentary for Trade #{trade.id}: ongoing averaging window."
+                a.is_adjustment = True
+
+        record_stage(
+            stage="ADJUSTMENT_REMINDER_DETECTED",
+            status="INFO",
+            message_id=db_message.id,
+            telegram_message_id=db_message.telegram_message_id,
+            trade_id=trade.id,
+            revision=rev,
+            details={
+                "trade_id": trade.id,
+                "reason": "Forward-looking planning commentary regarding potential averaging level",
+                "text_snippet": (db_message.text or "")[:100]
+            },
+            session=session
+        )
+        return True
+
+    # 2. Check if trade has reached max adjustments cap
+    if current_adj_count >= max_allowed:
+        logger.warning(
+            f"Trade #{trade.id} has already reached maximum allowed adjustments ({current_adj_count}/{max_allowed}). "
+            f"Blocking additional averaging orders from Message ID {db_message.id}."
+        )
+        for a in analysis.actions:
+            if getattr(a, "action_type", "").upper() in ["BUY", "SELL"]:
+                a.action_type = "INFO"
+                a.details = f"Averaging blocked: Trade #{trade.id} reached max adjustments limit ({current_adj_count}/{max_allowed})."
+                a.is_adjustment = True
+
+        record_stage(
+            stage="ADJUSTMENT_LIMIT_REACHED",
+            status="WARNING",
+            message_id=db_message.id,
+            telegram_message_id=db_message.telegram_message_id,
+            trade_id=trade.id,
+            revision=rev,
+            error_message=f"Trade #{trade.id} reached max adjustments limit ({current_adj_count}/{max_allowed}).",
+            details={
+                "trade_id": trade.id,
+                "current_adjustments": current_adj_count,
+                "max_allowed": max_allowed
+            },
+            session=session
+        )
+        return True
+
+    # 3. Check rolling time window & pending order deduplication
+    is_dup_window = False
+    window_diff_mins = None
+    if trade.last_adjustment_at:
+        diff_secs = (msg_date - trade.last_adjustment_at).total_seconds()
+        if 0 <= diff_secs < (window_minutes * 60):
+            is_dup_window = True
+            window_diff_mins = round(diff_secs / 60.0, 1)
+
+    # Check for pending / placed adjustment actions on this trade
+    has_pending_adj = any(
+        a.order_status in ["PENDING", "PLACED"] and getattr(a, "is_adjustment", False)
+        for a in trade.actions
+    )
+
+    is_reminder = (
+        getattr(analysis, "is_adjustment_reminder", False) is True or
+        is_adjustment_reminder_text(db_message.text)
+    )
+
+    if is_dup_window or has_pending_adj or (current_adj_count > 0 and is_reminder):
+        logger.info(
+            f"Averaging adjustment for Trade #{trade.id} deduplicated: "
+            f"Already executed/active within {window_diff_mins or 'N/A'} mins (window: {window_minutes} mins, pending: {has_pending_adj}, reminder: {is_reminder})."
+        )
+        for a in analysis.actions:
+            if getattr(a, "action_type", "").upper() in ["BUY", "SELL"]:
+                a.action_type = "INFO"
+                a.details = f"Averaging deduplicated: Adjustment already active/recorded for Trade #{trade.id} within rolling window."
+                a.is_adjustment = True
+
+        stage_name = "ADJUSTMENT_REMINDER_DETECTED" if is_reminder else "ADJUSTMENT_DEDUPLICATED"
+        record_stage(
+            stage=stage_name,
+            status="INFO",
+            message_id=db_message.id,
+            telegram_message_id=db_message.telegram_message_id,
+            trade_id=trade.id,
+            revision=rev,
+            details={
+                "trade_id": trade.id,
+                "window_minutes": window_minutes,
+                "mins_since_last_adjustment": window_diff_mins,
+                "has_pending_adj": has_pending_adj,
+                "is_reminder": is_reminder
+            },
+            session=session
+        )
+        return True
+
+    # 4. Valid New Adjustment Approved
+    new_adj_number = current_adj_count + 1
+    trade.adjustment_count = new_adj_number
+    trade.last_adjustment_at = msg_date
+    
+    first_entry_act = entry_actions[0]
+    p_val = parse_price_value(getattr(first_entry_act, "price", None))
+    if p_val:
+        trade.last_adjustment_price = p_val
+    if getattr(first_entry_act, "strike", None):
+        trade.last_adjustment_strike = float(first_entry_act.strike)
+
+    session.commit()
+
+    logger.info(f"Approved Adjustment #{new_adj_number} for Trade #{trade.id} (capped at {max_adj_lots} lot(s)).")
+    for a in analysis.actions:
+        if getattr(a, "action_type", "").upper() in ["BUY", "SELL"]:
+            a.is_adjustment = True
+            a.lots = min(getattr(a, "lots", 1) or 1, max_adj_lots)
+
+    record_stage(
+        stage="ADJUSTMENT_APPROVED",
+        status="SUCCESS",
+        message_id=db_message.id,
+        telegram_message_id=db_message.telegram_message_id,
+        trade_id=trade.id,
+        revision=rev,
+        details={
+            "trade_id": trade.id,
+            "adjustment_number": new_adj_number,
+            "max_adjustments": max_allowed,
+            "allocated_lots": max_adj_lots,
+            "actions_count": len(entry_actions)
+        },
+        session=session
+    )
+    return True
+
+def format_important_notice_telegram_html(trade: Trade, unexecuted_actions: list) -> str:
+    """
+    Formats a high-priority 'IMPORTANT NOTICE' Telegram HTML alert
+    for any identified trade action item that was not executed on Zerodha.
+    """
+    msg_parts = [
+        "🚨 <b>IMPORTANT NOTICE: ACTION(S) NOT EXECUTED</b> 🚨\n",
+        f"<b>Trade ID:</b> #{trade.id}",
+        f"<b>Underlying:</b> {trade.underlying or 'N/A'}"
+    ]
+    if trade.structure_type:
+        msg_parts.append(f"<b>Strategy:</b> {trade.structure_type}")
+
+    msg_parts.append("\n⚠️ <b>The following identified action items were NOT executed on Zerodha:</b>\n")
+
+    for act in unexecuted_actions:
+        action_prefix = "• "
+        if act.action_type == "BUY":
+            action_prefix += "🟢 <b>BUY:</b> "
+        elif act.action_type == "SELL":
+            action_prefix += "🔴 <b>SELL:</b> "
+        elif act.action_type in ["EXIT", "CLOSE_LEG"]:
+            action_prefix += "🚪 <b>EXIT:</b> "
+        elif act.action_type == "UPDATE_SL":
+            action_prefix += "🛡️ <b>UPDATE SL:</b> "
+        else:
+            action_prefix += "ℹ️ <b>ACTION:</b> "
+
+        leg_title = f"{action_prefix}"
+        if act.tradingsymbol:
+            leg_title += f"<code>{act.tradingsymbol}</code> "
+        elif act.instrument_name:
+            leg_title += f"<code>{act.instrument_name}</code> "
+        else:
+            leg_title += f"<code>{act.action_type} {act.underlying or ''}</code> "
+
+        detail_parts = []
+        if act.transaction_type:
+            detail_parts.append(f"Side: <b>{act.transaction_type}</b>")
+        if act.quantity:
+            lots_num = act.lots or 1
+            lots_text = f"{lots_num} lot" if lots_num == 1 else f"{lots_num} lots"
+            detail_parts.append(f"Qty: <b>{act.quantity}</b> ({lots_text})")
+        if act.order_type:
+            detail_parts.append(f"Type: <b>{act.order_type}</b>")
+        if act.price:
+            detail_parts.append(f"Price: <code>{act.price}</code>")
+
+        if detail_parts:
+            leg_title += f"({', '.join(detail_parts)})"
+
+        msg_parts.append(leg_title)
+
+        reason = act.zerodha_response or "Order placement was blocked or rejected"
+        status_label = act.order_status or "UNEXECUTED"
+        msg_parts.append(f"  ❌ <b>Status:</b> <code>{status_label}</code>")
+        msg_parts.append(f"  ⚠️ <b>Reason:</b> <i>{reason}</i>\n")
+
+    msg_parts.append("🛠️ <b>Manual Action Required:</b> Please check your Zerodha account immediately to manage open risk or place the required leg(s) manually.")
+
+    return "\n".join(msg_parts)
+
 
 def format_action_telegram_message_html(trade: Trade, actions: list) -> str:
     """Formats actions into a beautiful Telegram HTML message with Zerodha execution info."""
     is_exit = any(a.action_type == 'EXIT' for a in actions)
     is_update = any(a.action_type in ['UPDATE_SL', 'CLOSE_LEG', 'INFO'] for a in actions)
+    is_adj = any(getattr(a, "is_adjustment", False) for a in actions)
     
     msg_parts = []
     
     if is_exit:
         msg_parts.append("🚪 <b>TRADE CLOSED</b>")
+    elif is_adj:
+        adj_num = getattr(actions[0], "adjustment_number", None) or trade.adjustment_count or 1
+        msg_parts.append(f"🔄 <b>TRADE ADJUSTMENT #{adj_num} DETECTED</b>")
     elif is_update:
         msg_parts.append("🔄 <b>TRADE UPDATE</b>")
     else:
@@ -91,14 +379,18 @@ def format_action_telegram_message_html(trade: Trade, actions: list) -> str:
     msg_parts.append(f"<b>Underlying:</b> {trade.underlying or 'N/A'}")
     if trade.structure_type:
         msg_parts.append(f"<b>Strategy:</b> {trade.structure_type}")
+    if trade.adjustment_count:
+        max_adj = trade.max_adjustments if trade.max_adjustments is not None else 1
+        msg_parts.append(f"<b>Adjustments:</b> {trade.adjustment_count}/{max_adj}")
         
     msg_parts.append("\n<b>Actions & Zerodha Order Details:</b>")
     for action in actions:
         action_prefix = "• "
+        adj_tag = f" (Adj #{action.adjustment_number})" if getattr(action, "is_adjustment", False) and action.adjustment_number else ""
         if action.action_type == "BUY":
-            action_prefix += "🟢 <b>BUY:</b> "
+            action_prefix += f"🟢 <b>BUY{adj_tag}:</b> "
         elif action.action_type == "SELL":
-            action_prefix += "🔴 <b>SELL:</b> "
+            action_prefix += f"🔴 <b>SELL{adj_tag}:</b> "
         elif action.action_type == "EXIT":
             action_prefix += "🚪 <b>EXIT:</b> "
         elif action.action_type == "UPDATE_SL":
@@ -134,10 +426,12 @@ def format_action_telegram_message_html(trade: Trade, actions: list) -> str:
             action_line += f"({', '.join(detail_parts)})"
 
         if action.order_status and action.order_status != "PENDING":
-            status_icon = "✅" if action.order_status == "PLACED" else "❌"
+            status_icon = "✅" if action.order_status in ["PLACED", "EXECUTED"] else "❌"
             action_line += f"\n  Status: {status_icon} <b>{action.order_status}</b>"
             if action.zerodha_order_id:
                 action_line += f" (Order ID: <code>{action.zerodha_order_id}</code>)"
+            if action.order_status == "FAILED" and action.zerodha_response:
+                action_line += f"\n  ⚠️ <i>Error: {action.zerodha_response}</i>"
 
         if action.details:
             action_line += f"\n  <i>Note: {action.details}</i>"
@@ -152,9 +446,9 @@ def format_action_telegram_message_html(trade: Trade, actions: list) -> str:
 def ensure_square_off_actions(session: Session, trade: Trade, db_message: Message, parsed_actions: list = None) -> list:
     """
     Scans a trade's open entry legs and creates reverse square-off Action records
-    if the trade is being closed or exited, avoiding duplicate square-offs.
+    if the trade is being closed or exited, computing net active quantities
+    to ensure 100% of initial and averaged lots are completely closed.
     """
-    # Find all prior entry legs for this trade that have a resolved tradingsymbol
     entry_actions = session.query(Action).filter(
         Action.trade_id == trade.id,
         Action.action_type.in_(["BUY", "SELL"]),
@@ -164,23 +458,45 @@ def ensure_square_off_actions(session: Session, trade: Trade, db_message: Messag
     if not entry_actions:
         return []
 
+    # Map aggregate entry quantity and lots per tradingsymbol
+    symbol_entry_map = {}
+    for entry_act in entry_actions:
+        sym = entry_act.tradingsymbol
+        if sym not in symbol_entry_map:
+            symbol_entry_map[sym] = {
+                "quantity": 0,
+                "lots": 0,
+                "transaction_type": (entry_act.transaction_type or entry_act.action_type).upper(),
+                "template_action": entry_act
+            }
+        symbol_entry_map[sym]["quantity"] += (entry_act.quantity or 0)
+        symbol_entry_map[sym]["lots"] += (entry_act.lots or 1)
+
     # Find already existing exit actions for this trade
     existing_exit_actions = session.query(Action).filter(
         Action.trade_id == trade.id,
         Action.action_type.in_(["EXIT", "CLOSE_LEG"])
     ).all()
-    already_exited_symbols = {a.tradingsymbol for a in existing_exit_actions if a.tradingsymbol}
+    already_exited_qty = {}
+    for ex in existing_exit_actions:
+        if ex.tradingsymbol:
+            already_exited_qty[ex.tradingsymbol] = already_exited_qty.get(ex.tradingsymbol, 0) + (ex.quantity or 0)
 
     parsed_actions = parsed_actions or []
     new_square_off_actions = []
 
-    for entry_act in entry_actions:
-        if entry_act.tradingsymbol in already_exited_symbols:
-            logger.info(f"Leg {entry_act.tradingsymbol} already has a square-off action. Skipping.")
+    for sym, entry_info in symbol_entry_map.items():
+        net_qty = entry_info["quantity"] - already_exited_qty.get(sym, 0)
+        if net_qty <= 0:
+            logger.info(f"Leg {sym} for Trade #{trade.id} already has complete square-off coverage. Skipping.")
             continue
 
+        entry_act = entry_info["template_action"]
+        per_lot_qty = int(entry_act.quantity / (entry_act.lots or 1)) if entry_act.quantity and entry_act.lots else (entry_act.quantity or 1)
+        net_lots = max(1, int(round(net_qty / per_lot_qty))) if per_lot_qty > 0 else entry_info["lots"]
+
         # Determine reverse transaction type: SELL -> BUY, BUY -> SELL
-        original_tt = (entry_act.transaction_type or entry_act.action_type).upper()
+        original_tt = entry_info["transaction_type"]
         reverse_tt = "BUY" if original_tt == "SELL" else "SELL"
 
         # Check if AI parsed explicit price or order_type for this leg in parsed_actions
@@ -189,7 +505,7 @@ def ensure_square_off_actions(session: Session, trade: Trade, db_message: Messag
             pa_sym = clean_symbol(getattr(pa, "underlying", None) or getattr(pa, "instrument_name", None))
             pa_strike = getattr(pa, "strike", None)
             if (entry_act.strike and pa_strike and abs(entry_act.strike - pa_strike) < 0.01) or \
-               (entry_act.tradingsymbol and pa_sym and pa_sym in entry_act.tradingsymbol):
+               (sym and pa_sym and pa_sym in sym):
                 matching_parsed = pa
                 break
 
@@ -213,15 +529,15 @@ def ensure_square_off_actions(session: Session, trade: Trade, db_message: Messag
             stoploss=None,
             target=None,
             is_limit=is_lim,
-            details=f"Square-off exit leg for {entry_act.tradingsymbol}",
+            details=f"Square-off exit leg for {sym} (Net Qty: {net_qty})",
             telegram_sent=False,
             underlying=entry_act.underlying,
             option_type=entry_act.option_type,
             strike=entry_act.strike,
             expiry=entry_act.expiry,
-            lots=entry_act.lots,
-            quantity=entry_act.quantity,
-            tradingsymbol=entry_act.tradingsymbol,
+            lots=net_lots,
+            quantity=net_qty,
+            tradingsymbol=sym,
             instrument_token=entry_act.instrument_token,
             transaction_type=reverse_tt,
             order_type=ord_type,
@@ -230,8 +546,11 @@ def ensure_square_off_actions(session: Session, trade: Trade, db_message: Messag
         )
         session.add(square_off_action)
         new_square_off_actions.append(square_off_action)
-        already_exited_symbols.add(entry_act.tradingsymbol)
-        logger.info(f"Generated square-off action for Trade #{trade.id}: {reverse_tt} {entry_act.quantity} x {entry_act.tradingsymbol} ({ord_type})")
+        already_exited_qty[sym] = already_exited_qty.get(sym, 0) + net_qty
+        logger.info(f"Generated square-off action for Trade #{trade.id}: {reverse_tt} {net_qty} ({net_lots}L) x {sym} ({ord_type})")
+
+    # Order square-off actions so BUY legs (closing short positions) precede SELL legs (closing long hedge positions)
+    new_square_off_actions.sort(key=lambda a: 0 if (a.transaction_type or a.action_type or "").upper() == "BUY" else 1)
 
     session.commit()
     return new_square_off_actions
@@ -245,8 +564,8 @@ def process_trade_actions_and_sizing(
 ) -> list:
     """
     Resolves NFO instruments, determines main vs hedge leg roles,
-    calculates trade lots from target investment budget (.env), ensures hedge
-    quantity matches main quantity, and returns list of Action DB objects.
+    calculates trade lots from target investment budget (.env) or adjustment caps,
+    ensures hedge quantity matches main quantity, and returns list of Action DB objects.
     """
     if target_budget is None:
         raw_budget = os.getenv("TARGET_INVESTMENT_BUDGET") or os.getenv("TARGET_INVESTMENT_BUDGET_MAIN")
@@ -256,14 +575,16 @@ def process_trade_actions_and_sizing(
             except (ValueError, TypeError):
                 target_budget = None
 
+    max_adj_lots = int(os.getenv("ADJUSTMENT_MAX_LOTS", "1"))
     resolved_items = []
     entry_indices = []
 
     for idx, action_schema in enumerate(parsed_actions):
-        u_symbol = clean_symbol(getattr(action_schema, "underlying", None) or trade.underlying)
+        u_symbol = clean_symbol(getattr(action_schema, "underlying", None) or (trade.underlying if trade else None))
         o_type = getattr(action_schema, "option_type", None) or "CE"
         strike_val = getattr(action_schema, "strike", None)
         expiry_str = getattr(action_schema, "expiry_info", None)
+        is_adj_leg = bool(getattr(action_schema, "is_adjustment", False))
 
         inst = resolve_nfo_instrument(u_symbol, strike_val, o_type, expiry_str)
         action_type = getattr(action_schema, "action_type", "INFO").upper()
@@ -277,6 +598,8 @@ def process_trade_actions_and_sizing(
             "expiry": inst["expiry"] if inst else expiry_str,
             "inst": inst,
             "is_main": True,
+            "is_adjustment": is_adj_leg,
+            "adjustment_number": getattr(trade, "adjustment_count", None) if is_adj_leg else None,
             "lots": getattr(action_schema, "lots", None) or 1,
             "quantity": None
         })
@@ -355,25 +678,32 @@ def process_trade_actions_and_sizing(
                     logger.warning(f"Error querying live Zerodha basket margin: {me}")
 
         # 4. Calculate lots and sizing via margin-based engine
-        sizing_result = calculate_position_size(
-            entry_legs=entry_legs_list,
-            target_budget=target_budget,
-            underlying=main_item["underlying"],
-            live_margin=live_margin,
-            main_price=main_price
-        )
+        is_adjustment_run = any(item.get("is_adjustment") for item in entry_legs_list)
 
-        calculated_lots = sizing_result["lots"]
+        if is_adjustment_run:
+            # Averaging legs are strictly sized by ADJUSTMENT_MAX_LOTS to prevent position bloating
+            calculated_lots = max_adj_lots
+            logger.info(f"Trade #{trade.id if trade else 'N/A'} is an ADJUSTMENT leg: Sizing set to {calculated_lots} lot(s) (ADJUSTMENT_MAX_LOTS cap).")
+        else:
+            sizing_result = calculate_position_size(
+                entry_legs=entry_legs_list,
+                target_budget=target_budget,
+                underlying=main_item["underlying"],
+                live_margin=live_margin,
+                main_price=main_price
+            )
+            calculated_lots = sizing_result["lots"]
+
+            logger.info(
+                f"Trade #{trade.id if trade else 'N/A'} Margin Sizing Result: "
+                f"underlying={main_item['underlying']} (Index={sizing_result['is_index']}), "
+                f"strategy={sizing_result['strategy_type']}, method={sizing_result['sizing_method']}, "
+                f"budget=Rs.{target_budget or 0:,.2f}, per_lot_capital=Rs.{sizing_result['per_lot_capital']:,.2f}, "
+                f"raw_lots={sizing_result['raw_lots']:.2f}, max_cap={sizing_result['max_lot_cap']} -> "
+                f"final_lots={calculated_lots}, main_qty={calculated_lots * main_lot_size}"
+            )
+
         main_quantity = calculated_lots * main_lot_size
-
-        logger.info(
-            f"Trade #{trade.id if trade else 'N/A'} Margin Sizing Result: "
-            f"underlying={main_item['underlying']} (Index={sizing_result['is_index']}), "
-            f"strategy={sizing_result['strategy_type']}, method={sizing_result['sizing_method']}, "
-            f"budget=Rs.{target_budget or 0:,.2f}, per_lot_capital=Rs.{sizing_result['per_lot_capital']:,.2f}, "
-            f"raw_lots={sizing_result['raw_lots']:.2f}, max_cap={sizing_result['max_lot_cap']} -> "
-            f"final_lots={calculated_lots}, main_qty={main_quantity}"
-        )
 
         # 5. Set sizing and role for all entry legs
         for i in entry_indices:
@@ -426,8 +756,8 @@ def process_trade_actions_and_sizing(
                         if pa.action_type in ["BUY", "SELL"]:
                             if (inst and pa.tradingsymbol == inst.get("tradingsymbol")) or \
                                (strike_val and pa.strike and abs(pa.strike - strike_val) < 0.01):
-                                matching_entry = pa
-                                break
+                                 matching_entry = pa
+                                 break
                 if matching_entry:
                     trans_type = "BUY" if matching_entry.transaction_type == "SELL" else "SELL"
                 else:
@@ -445,6 +775,8 @@ def process_trade_actions_and_sizing(
             message_id=db_message_id,
             action_type=action_type,
             is_main=item["is_main"],
+            is_adjustment=item.get("is_adjustment", False),
+            adjustment_number=item.get("adjustment_number", None),
             instrument_name=getattr(schema, "instrument_name", None),
             price=getattr(schema, "price", None),
             stoploss=getattr(schema, "stoploss", None),
@@ -467,12 +799,19 @@ def process_trade_actions_and_sizing(
         )
         actions_to_add.append(db_action)
 
+    # Sort actions so BUY (long/hedge) legs precede SELL (short/main) legs
+    actions_to_add.sort(key=lambda a: 0 if (a.transaction_type or a.action_type or "").upper() == "BUY" else 1)
+
     return actions_to_add
 
 
 def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = False) -> list:
     """
     Executes Zerodha orders for pending actionable legs of a given trade with deduplication checks.
+    Enforces strict execution ordering and two-phase verification for multi-leg / hedged setups:
+      - Phase 1: Submits and confirms all BUY (hedge/long) legs first on the exchange.
+      - Phase 2: Waits for successful BUY confirmation before placing SELL (short/main) legs to guarantee
+                 Zerodha / exchange margin relief (~35k vs ~1.5L) and prevent unhedged naked short exposure.
     If auto_mode is True, checks AUTO_PLACE_ORDERS for entry actions and AUTO_PLACE_EXIT_ORDERS for exit actions.
     """
     auto_entry = os.getenv("AUTO_PLACE_ORDERS", "false").lower() in ("true", "1", "t", "yes")
@@ -484,8 +823,28 @@ def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = Fal
         Action.action_type.in_(["BUY", "SELL", "EXIT", "CLOSE_LEG"])
     ).all()
 
+    if not actions:
+        return []
+
+    # Separate actions into Phase 1 (BUY / Long / Hedge legs) and Phase 2 (SELL / Short / Main legs)
+    buy_actions = []
+    sell_actions = []
+    other_actions = []
+
+    for act in actions:
+        side = (act.transaction_type or act.action_type or "").upper()
+        if side == "BUY":
+            buy_actions.append(act)
+        elif side == "SELL":
+            sell_actions.append(act)
+        else:
+            other_actions.append(act)
+
     results = []
-    for action in actions:
+    hedge_failed = False
+    failed_hedge_symbols = []
+
+    def _execute_single_action(action: Action) -> dict:
         if not action.tradingsymbol or not action.quantity:
             logger.warning(f"Action ID {action.id} missing tradingsymbol or quantity. Skipping order placement.")
             record_stage(
@@ -497,7 +856,14 @@ def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = Fal
                 error_message="Missing tradingsymbol or quantity for order execution",
                 session=session
             )
-            continue
+            return {
+                "action_id": action.id,
+                "tradingsymbol": action.tradingsymbol,
+                "success": False,
+                "confirmed": False,
+                "order_id": None,
+                "message": "Missing tradingsymbol or quantity"
+            }
 
         is_exit = action.action_type in ["EXIT", "CLOSE_LEG"]
 
@@ -513,7 +879,15 @@ def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = Fal
                     details={"action_id": action.id, "tradingsymbol": action.tradingsymbol, "reason": "AUTO_PLACE_EXIT_ORDERS is false", "is_exit": True},
                     session=session
                 )
-                continue
+                return {
+                    "action_id": action.id,
+                    "tradingsymbol": action.tradingsymbol,
+                    "success": False,
+                    "confirmed": False,
+                    "skipped_auto": True,
+                    "order_id": None,
+                    "message": "AUTO_PLACE_EXIT_ORDERS is false"
+                }
             elif not is_exit and not auto_entry:
                 logger.info(f"Skipping auto-placement for Entry Action ID {action.id} (AUTO_PLACE_ORDERS is false).")
                 record_stage(
@@ -524,7 +898,15 @@ def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = Fal
                     details={"action_id": action.id, "tradingsymbol": action.tradingsymbol, "reason": "AUTO_PLACE_ORDERS is false", "is_exit": False},
                     session=session
                 )
-                continue
+                return {
+                    "action_id": action.id,
+                    "tradingsymbol": action.tradingsymbol,
+                    "success": False,
+                    "confirmed": False,
+                    "skipped_auto": True,
+                    "order_id": None,
+                    "message": "AUTO_PLACE_ORDERS is false"
+                }
 
         # 1. Deduplication check against existing Zerodha orders & positions
         dedup_check = check_existing_zerodha_order_or_position(
@@ -557,14 +939,14 @@ def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = Fal
                 session=session
             )
 
-            results.append({
+            return {
                 "action_id": action.id,
                 "tradingsymbol": action.tradingsymbol,
                 "success": True,
+                "confirmed": True,
                 "order_id": action.zerodha_order_id or "DEDUPLICATED",
                 "message": dedup_check["message"]
-            })
-            continue
+            }
 
         # Extract numerical price if limit order
         limit_price = None
@@ -609,6 +991,15 @@ def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = Fal
                 },
                 session=session
             )
+            session.commit()
+            return {
+                "action_id": action.id,
+                "tradingsymbol": action.tradingsymbol,
+                "success": True,
+                "confirmed": True,
+                "order_id": res["order_id"],
+                "message": res["message"]
+            }
         else:
             action.order_status = "FAILED"
             action.zerodha_response = res["message"]
@@ -628,15 +1019,94 @@ def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = Fal
                 },
                 session=session
             )
+            session.commit()
+            return {
+                "action_id": action.id,
+                "tradingsymbol": action.tradingsymbol,
+                "success": False,
+                "confirmed": False,
+                "order_id": res.get("order_id"),
+                "message": res["message"]
+            }
 
-        session.commit()
-        results.append({
-            "action_id": action.id,
-            "tradingsymbol": action.tradingsymbol,
-            "success": res["success"],
-            "order_id": res["order_id"],
-            "message": res["message"]
-        })
+    # =========================================================================
+    # PHASE 1: Execute BUY (Hedge / Long / Short-Covering) Legs First
+    # =========================================================================
+    if buy_actions:
+        logger.info(f"Phase 1: Submitting {len(buy_actions)} BUY leg(s) first to establish exchange margin relief...")
+        for act in buy_actions:
+            r = _execute_single_action(act)
+            results.append(r)
+            if not r["success"] or not r.get("confirmed", False):
+                if not r.get("skipped_auto"):
+                    hedge_failed = True
+                    failed_hedge_symbols.append(act.tradingsymbol or f"Action #{act.id}")
+
+        if not hedge_failed and not any(r.get("skipped_auto") for r in results):
+            logger.info(f"Phase 1 SUCCESS: All BUY/hedge legs confirmed on exchange for Trade #{trade_id}.")
+            record_stage(
+                stage="HEDGE_LEGS_CONFIRMED",
+                status="SUCCESS",
+                trade_id=trade_id,
+                details={
+                    "trade_id": trade_id,
+                    "buy_legs_count": len(buy_actions),
+                    "legs": [a.tradingsymbol for a in buy_actions]
+                },
+                session=session
+            )
+
+    # =========================================================================
+    # PHASE 2: Two-Phase Verification Gate & SELL Leg Execution
+    # =========================================================================
+    if sell_actions:
+        if hedge_failed:
+            failed_str = ", ".join(failed_hedge_symbols)
+            abort_msg = (
+                f"Two-phase verification failed: Long hedge leg ({failed_str}) failed confirmation. "
+                f"SELL short leg placement blocked to prevent naked margin rejection (~1.5L vs ~35k) and unhedged risk."
+            )
+            logger.error(f"Trade #{trade_id} Phase 2 ABORTED: {abort_msg}")
+
+            for act in sell_actions:
+                act.order_status = "FAILED"
+                act.zerodha_response = abort_msg
+                session.commit()
+
+                record_stage(
+                    stage="ORDER_EXECUTION_BLOCKED",
+                    status="ERROR",
+                    message_id=act.message_id,
+                    trade_id=trade_id,
+                    error_message=abort_msg,
+                    details={
+                        "action_id": act.id,
+                        "tradingsymbol": act.tradingsymbol,
+                        "transaction_type": act.transaction_type,
+                        "failed_hedge_symbols": failed_hedge_symbols,
+                        "reason": "Hedge confirmation failed; short order placement aborted"
+                    },
+                    session=session
+                )
+
+                results.append({
+                    "action_id": act.id,
+                    "tradingsymbol": act.tradingsymbol,
+                    "success": False,
+                    "confirmed": False,
+                    "order_id": None,
+                    "message": abort_msg
+                })
+        else:
+            logger.info(f"Phase 2: Submitting {len(sell_actions)} SELL leg(s) with margin relief confirmed...")
+            for act in sell_actions:
+                r = _execute_single_action(act)
+                results.append(r)
+
+    # Execute any remaining actions
+    for act in other_actions:
+        r = _execute_single_action(act)
+        results.append(r)
 
     return results
 
@@ -684,6 +1154,17 @@ def setup_telegram_event_handlers():
 
                 res_msg = "\n".join(lines)
                 await event.respond(res_msg, parse_mode='html')
+
+                # If any action failed or was blocked during manual execution, send Important Notice
+                failed_manual = [r for r in results if not r.get("success")]
+                if failed_manual:
+                    unexec_acts = [
+                        a for a in trade.actions
+                        if a.order_status in ["FAILED", "CANCELLED"] or any(f.get("tradingsymbol") == a.tradingsymbol for f in failed_manual)
+                    ]
+                    if unexec_acts:
+                        notice_html = format_important_notice_telegram_html(trade, unexec_acts)
+                        await event.respond(notice_html, parse_mode='html')
 
                 # Update original message in channel if possible
                 session.refresh(trade)
@@ -1066,8 +1547,13 @@ async def process_single_message(session: Session, db_message: Message, actions_
             "is_continuation": analysis.is_continuation,
             "underlying": trade.underlying,
             "structure_type": trade.structure_type,
-            "status": trade.status
+            "status": trade.status,
+            "adjustment_count": trade.adjustment_count
         })
+
+    # 3b. Trade Adjustment & Averaging Lifecycle State Machine Check
+    if trade and trade.status == "OPEN" and analysis.actions:
+        evaluate_and_deduplicate_adjustments(session, trade, db_message, analysis, rev)
 
     # 4. Instrument Resolution and Budget Lot Sizing
     db_actions = []
@@ -1143,13 +1629,52 @@ async def process_single_message(session: Session, db_message: Message, actions_
                     buttons = [Button.inline("🚀 Place Order(s)", data=f"place_order:{trade.id}")]
 
                 await client.send_message(actions_entity, html_msg, parse_mode='html', buttons=buttons)
-                
+
+                # Check for any unexecuted / failed action items to dispatch an immediate IMPORTANT NOTICE
+                unexecuted_actions = [
+                    a for a in db_actions
+                    if a.action_type in ["BUY", "SELL", "EXIT", "CLOSE_LEG"]
+                    and a.order_status in ["FAILED", "CANCELLED"]
+                ]
+                # Also include actionable legs missing tradingsymbol or quantity
+                for ua in db_actions:
+                    if ua.action_type in ["BUY", "SELL", "EXIT", "CLOSE_LEG"] and (not ua.tradingsymbol or not ua.quantity) and ua not in unexecuted_actions:
+                        if not ua.zerodha_response:
+                            ua.zerodha_response = "Missing tradingsymbol or quantity; could not be resolved from master instruments"
+                        unexecuted_actions.append(ua)
+
+                if unexecuted_actions:
+                    logger.warning(f"Sending Important Notice for {len(unexecuted_actions)} unexecuted action(s) in Trade #{trade.id}")
+                    notice_msg = format_important_notice_telegram_html(trade, unexecuted_actions)
+                    
+                    notice_buttons = [Button.inline("🚀 Retry / Place Order(s)", data=f"place_order:{trade.id}")]
+                    await client.send_message(actions_entity, notice_msg, parse_mode='html', buttons=notice_buttons)
+                    
+                    record_stage(
+                        stage="TELEGRAM_IMPORTANT_NOTICE_SENT",
+                        status="WARNING",
+                        message_id=db_message.id,
+                        telegram_message_id=db_message.telegram_message_id,
+                        trade_id=trade.id,
+                        revision=rev,
+                        details={
+                            "unexecuted_actions_count": len(unexecuted_actions),
+                            "unexecuted_symbols": [a.tradingsymbol or a.instrument_name or a.action_type for a in unexecuted_actions],
+                            "reasons": [a.zerodha_response for a in unexecuted_actions]
+                        },
+                        session=session
+                    )
+
                 # Mark actions as sent
                 for a in db_actions:
                     a.telegram_sent = True
                 session.commit()
                 logger.info(f"Action notifications sent to Telegram for Trade ID {trade.id}")
-                ctx.set_details({"has_pending_orders": has_pending_orders, "actions_notified": len(db_actions)})
+                ctx.set_details({
+                    "has_pending_orders": has_pending_orders,
+                    "actions_notified": len(db_actions),
+                    "unexecuted_notified": len(unexecuted_actions)
+                })
             except Exception as ae:
                 logger.error(f"Failed to send actions notification: {ae}")
                 ctx.set_error(str(ae))

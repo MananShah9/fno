@@ -355,14 +355,14 @@ class TestMarginSizingLogic(unittest.TestCase):
         )
 
         self.assertEqual(len(actions), 2)
-        # Check lot sizing and quantity consistency
-        sell_act = actions[0]
-        buy_act = actions[1]
+        # Check execution ordering: BUY (hedge) leg MUST be first, SELL (main) leg second
+        buy_act = actions[0]
+        sell_act = actions[1]
 
-        self.assertEqual(sell_act.action_type, "SELL")
         self.assertEqual(buy_act.action_type, "BUY")
-        self.assertTrue(sell_act.is_main)
+        self.assertEqual(sell_act.action_type, "SELL")
         self.assertFalse(buy_act.is_main)
+        self.assertTrue(sell_act.is_main)
         self.assertEqual(sell_act.lots, buy_act.lots)
         self.assertEqual(sell_act.quantity, buy_act.quantity)
         self.assertLessEqual(sell_act.lots, 4)

@@ -76,6 +76,8 @@ def init_db():
         existing_cols = [col['name'] for col in inspector.get_columns('actions')]
         new_cols = {
             "is_main": "BOOLEAN DEFAULT TRUE",
+            "is_adjustment": "BOOLEAN DEFAULT FALSE",
+            "adjustment_number": "INTEGER",
             "underlying": "VARCHAR",
             "option_type": "VARCHAR",
             "strike": "DOUBLE PRECISION",
@@ -99,5 +101,25 @@ def init_db():
                     print(f"[*] Migration: Adding {col_name} column to actions table...")
                     try:
                         conn.execute(text(f"ALTER TABLE actions ADD COLUMN {col_name} {col_type}"))
+                    except Exception as me:
+                        print(f"Migration column error ({col_name}): {me}")
+
+    # 3. Ensure Trade adjustment lifecycle columns exist in trades table
+    if 'trades' in inspector.get_table_names():
+        existing_trade_cols = [col['name'] for col in inspector.get_columns('trades')]
+        trade_new_cols = {
+            "max_adjustments": "INTEGER DEFAULT 1",
+            "adjustment_count": "INTEGER DEFAULT 0",
+            "last_adjustment_at": "TIMESTAMP",
+            "last_adjustment_price": "DOUBLE PRECISION",
+            "last_adjustment_strike": "DOUBLE PRECISION"
+        }
+
+        with engine.begin() as conn:
+            for col_name, col_type in trade_new_cols.items():
+                if col_name not in existing_trade_cols:
+                    print(f"[*] Migration: Adding {col_name} column to trades table...")
+                    try:
+                        conn.execute(text(f"ALTER TABLE trades ADD COLUMN {col_name} {col_type}"))
                     except Exception as me:
                         print(f"Migration column error ({col_name}): {me}")
