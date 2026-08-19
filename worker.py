@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import logging
 import sys
@@ -12,7 +13,10 @@ from telethon import events, Button, utils
 import db
 from models import Message, Trade, Action
 from telegram_client import client, check_login, get_channel_entity
-from gemini_client import analyze_message_with_ai, clean_symbol, is_poke_message, classify_sl_trigger
+from gemini_client import (
+    analyze_message_with_ai, clean_symbol, is_poke_message, classify_sl_trigger,
+    is_emergency_exit_phrase, extract_exit_strikes_and_prices, ActionSchema
+)
 from instruments_manager import (
     resolve_nfo_instrument, parse_price_value, calculate_lots_from_budget,
     calculate_position_size, classify_strategy_type, get_margin_tier_estimate,
@@ -1679,6 +1683,67 @@ async def process_single_message(session: Session, db_message: Message, actions_
     db_message.ai_response = json.dumps(analysis.model_dump(), default=str)
     
     if not analysis.is_valid_trade_msg:
+        # High-Priority Deterministic Emergency Exit Rule:
+        # If unconditional exit phrase is detected and an unambiguous open trade exists, bypass AI non-trade classification.
+        if is_emergency_exit_phrase(db_message.text):
+            open_trades_db = session.query(Trade).filter(Trade.status == "OPEN").all()
+            target_trade = None
+            if len(open_trades_db) == 1:
+                target_trade = open_trades_db[0]
+            elif len(open_trades_db) > 1:
+                msg_nums = re.findall(r'\b\d{4,6}\b', db_message.text)
+                if msg_nums:
+                    msg_strikes = [float(n) for n in msg_nums]
+                    for ot in open_trades_db:
+                        ot_strikes = [a.strike for a in ot.actions if a.strike is not None]
+                        if any(s in ot_strikes for s in msg_strikes):
+                            target_trade = ot
+                            break
+                if not target_trade:
+                    try:
+                        broker_pos = get_zerodha_net_positions()
+                        if broker_pos.get("success"):
+                            active_syms = [s for s, q in broker_pos.get("positions", {}).items() if q != 0]
+                            matching_trades = [
+                                ot for ot in open_trades_db
+                                if any(a.tradingsymbol in active_syms for a in ot.actions if a.tradingsymbol)
+                            ]
+                            if len(matching_trades) == 1:
+                                target_trade = matching_trades[0]
+                    except Exception as bpe:
+                        logger.warning(f"Error checking broker positions during emergency exit rescue: {bpe}")
+
+            if target_trade:
+                logger.warning(
+                    f"[EMERGENCY EXIT DETECTED] Message ID {db_message.id} ('{db_message.text.strip()}') "
+                    f"matches unambiguous open Trade #{target_trade.id} ({target_trade.underlying}). "
+                    f"Bypassing AI non-trade classification!"
+                )
+                analysis.is_valid_trade_msg = True
+                analysis.is_continuation = True
+                analysis.trade_status_update = "CLOSED"
+                analysis.related_open_trade_id = target_trade.id
+                analysis.underlying = target_trade.underlying
+                analysis.structure_type = target_trade.structure_type
+                analysis.context_summary = f"Emergency exit override: Closing full position for Trade #{target_trade.id} ({target_trade.underlying})"
+
+                record_stage(
+                    stage="DETERMINISTIC_EMERGENCY_EXIT_OVERRIDE",
+                    status="SUCCESS",
+                    message_id=db_message.id,
+                    telegram_message_id=db_message.telegram_message_id,
+                    trade_id=target_trade.id,
+                    revision=rev,
+                    details={
+                        "trade_id": target_trade.id,
+                        "underlying": target_trade.underlying,
+                        "raw_text": db_message.text.strip(),
+                        "reason": "Emergency exit regex matched with unambiguous open trade in DB/portfolio"
+                    },
+                    session=session
+                )
+
+    if not analysis.is_valid_trade_msg:
         record_stage(
             stage="AI_NON_TRADE_MESSAGE",
             status="SKIPPED",
@@ -1693,6 +1758,24 @@ async def process_single_message(session: Session, db_message: Message, actions_
         db_message.processed_at = datetime.utcnow()
         session.commit()
         return True
+
+    # If actions is empty on an emergency exit message, check if strikes/prices can be extracted
+    if is_emergency_exit_phrase(db_message.text) and not analysis.actions:
+        extracted_legs = extract_exit_strikes_and_prices(db_message.text)
+        if extracted_legs:
+            u_for_leg = analysis.underlying
+            for leg in extracted_legs:
+                analysis.actions.append(ActionSchema(
+                    action_type="EXIT",
+                    underlying=u_for_leg,
+                    strike=leg["strike"],
+                    option_type=leg.get("option_type"),
+                    price=leg.get("price"),
+                    is_limit=bool(leg.get("price")),
+                    order_type="LIMIT" if leg.get("price") else "MARKET",
+                    is_main=leg.get("is_main", True),
+                    lots=1
+                ))
 
     logger.info(f"Valid trade detected by AI for message ID {db_message.id}.")
     trade = None
@@ -1724,13 +1807,20 @@ async def process_single_message(session: Session, db_message: Message, actions_
 
                 if candidate_trade:
                     has_new_structure = bool(analysis.structure_type and candidate_trade.structure_type and analysis.structure_type.upper() != candidate_trade.structure_type.upper() and not candidate_trade.structure_type.startswith(analysis.structure_type))
-                    if not has_new_structure or analysis.is_continuation or analysis.trade_status_update == "CLOSED" or any(a.action_type in ["EXIT", "CLOSE_LEG", "UPDATE_SL"] for a in analysis.actions) or not analysis.actions:
+                    if not has_new_structure or analysis.is_continuation or analysis.trade_status_update == "CLOSED" or is_emergency_exit_phrase(db_message.text) or any(a.action_type in ["EXIT", "CLOSE_LEG", "UPDATE_SL"] for a in analysis.actions) or not analysis.actions:
                         trade = candidate_trade
                         logger.info(f"Fallback mapped message ID {db_message.id} to open Trade ID {trade.id} ({candidate_trade.underlying})")
 
             # 2. Try matching by strike against open trade actions
-            if not trade and analysis.actions:
-                msg_strikes = [getattr(a, "strike", None) for a in analysis.actions if getattr(a, "strike", None)]
+            if not trade:
+                msg_strikes = []
+                if analysis.actions:
+                    msg_strikes = [getattr(a, "strike", None) for a in analysis.actions if getattr(a, "strike", None)]
+                if not msg_strikes and db_message.text:
+                    msg_nums = re.findall(r'\b\d{4,6}\b', db_message.text)
+                    if msg_nums:
+                        msg_strikes = [float(n) for n in msg_nums]
+
                 if msg_strikes:
                     open_trades_with_actions = session.query(Trade).filter(Trade.status == "OPEN").all()
                     for ot in open_trades_with_actions:
@@ -1741,7 +1831,7 @@ async def process_single_message(session: Session, db_message: Message, actions_
                             break
 
             # 3. If still not matched, and there is only 1 open trade, and message is an exit/closure
-            if not trade and (analysis.trade_status_update == "CLOSED" or any(a.action_type in ["EXIT", "CLOSE_LEG"] for a in analysis.actions)):
+            if not trade and (analysis.trade_status_update == "CLOSED" or is_emergency_exit_phrase(db_message.text) or any(a.action_type in ["EXIT", "CLOSE_LEG"] for a in analysis.actions)):
                 open_trades_list = session.query(Trade).filter(Trade.status == "OPEN").all()
                 if len(open_trades_list) == 1:
                     trade = open_trades_list[0]
@@ -1749,7 +1839,7 @@ async def process_single_message(session: Session, db_message: Message, actions_
 
         # Check for explicit closing keywords in message text
         msg_text_lower = (db_message.text or "").lower()
-        is_closing_phrase = any(w in msg_text_lower for w in [
+        is_closing_phrase = is_emergency_exit_phrase(db_message.text) or any(w in msg_text_lower for w in [
             "close the trade", "close full position", "closing the trade",
             "sl hit", "exit the full position", "exit full position",
             "profit booking in this trade", "close the entire position",
@@ -1873,7 +1963,7 @@ async def process_single_message(session: Session, db_message: Message, actions_
         })
 
     # 5. Automatic Square-Off Generation for exits / closed trades
-    if trade and (analysis.trade_status_update == "CLOSED" or trade.status == "CLOSED" or any(a.action_type in ["EXIT", "CLOSE_LEG"] for a in analysis.actions)):
+    if trade and (analysis.trade_status_update == "CLOSED" or trade.status == "CLOSED" or is_emergency_exit_phrase(db_message.text) or any(a.action_type in ["EXIT", "CLOSE_LEG"] for a in analysis.actions)):
         with StageContext("SQUARE_OFF_GENERATION", message_id=db_message.id, telegram_message_id=db_message.telegram_message_id, trade_id=trade.id, revision=rev, session=session) as ctx:
             sq_actions = ensure_square_off_actions(session, trade, db_message, analysis.actions)
             for sq_a in sq_actions:
@@ -1894,7 +1984,7 @@ async def process_single_message(session: Session, db_message: Message, actions_
         ctx.set_details({"results": exec_results, "auto_mode": True})
 
     # 6b. Live Position Book Closure Verification (if trade is closed or exiting)
-    if trade and (trade.status == "CLOSED" or analysis.trade_status_update == "CLOSED" or any(a.action_type in ["EXIT", "CLOSE_LEG"] for a in analysis.actions)):
+    if trade and (trade.status == "CLOSED" or analysis.trade_status_update == "CLOSED" or is_emergency_exit_phrase(db_message.text) or any(a.action_type in ["EXIT", "CLOSE_LEG"] for a in analysis.actions)):
         with StageContext("TRADE_POSITION_CLOSURE_VERIFICATION", message_id=db_message.id, telegram_message_id=db_message.telegram_message_id, trade_id=trade.id, revision=rev, session=session) as ctx:
             all_trade_acts = session.query(Action).filter(Action.trade_id == trade.id, Action.tradingsymbol != None).all()
             trade_symbols = list({a.tradingsymbol for a in all_trade_acts if a.tradingsymbol})
