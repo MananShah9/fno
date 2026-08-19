@@ -322,6 +322,8 @@ def format_important_notice_telegram_html(trade: Trade, unexecuted_actions: list
         reason = act.zerodha_response or "Order placement was blocked or rejected"
         status_label = act.order_status or "UNEXECUTED"
         msg_parts.append(f"  ❌ <b>Status:</b> <code>{status_label}</code>")
+        if getattr(act, "error_category", None):
+            msg_parts.append(f"  🏷️ <b>Category:</b> <code>{act.error_category}</code>")
         msg_parts.append(f"  ⚠️ <b>Reason:</b> <i>{reason}</i>\n")
 
     msg_parts.append("🛠️ <b>Manual Action Required:</b> Please check your Zerodha account immediately to manage open risk or place the required leg(s) manually.")
@@ -1673,6 +1675,7 @@ def execute_trade_actions(
             action.order_status = failed_st if failed_st in ["REJECTED", "CANCELLED", "FAILED"] else "FAILED"
             action.zerodha_response = res["message"]
             action.rejection_reason = res.get("status_message") or res["message"]
+            action.error_category = res.get("error_category")
             action.last_reconciled_at = datetime.utcnow()
             record_stage(
                 stage="ORDER_FAILED" if action.order_status == "FAILED" else "ORDER_REJECTED",
@@ -1688,7 +1691,9 @@ def execute_trade_actions(
                     "order_type": action.order_type,
                     "price": limit_price,
                     "order_status": action.order_status,
-                    "rejection_reason": action.rejection_reason
+                    "rejection_reason": action.rejection_reason,
+                    "error_category": res.get("error_category"),
+                    "error_class": res.get("error_class")
                 },
                 session=session
             )
@@ -1700,6 +1705,8 @@ def execute_trade_actions(
                 "confirmed": False,
                 "order_id": res.get("order_id"),
                 "status": action.order_status,
+                "error_category": res.get("error_category"),
+                "error_class": res.get("error_class"),
                 "message": res["message"]
             }
 
@@ -1745,6 +1752,7 @@ def execute_trade_actions(
             for act in sell_actions:
                 act.order_status = "FAILED"
                 act.zerodha_response = abort_msg
+                act.error_category = "MARGIN_RISK_ABORT"
                 session.commit()
 
                 record_stage(
@@ -1758,7 +1766,8 @@ def execute_trade_actions(
                         "tradingsymbol": act.tradingsymbol,
                         "transaction_type": act.transaction_type,
                         "failed_hedge_symbols": failed_hedge_symbols,
-                        "reason": "Hedge confirmation failed; short order placement aborted"
+                        "reason": "Hedge confirmation failed; short order placement aborted",
+                        "error_category": "MARGIN_RISK_ABORT"
                     },
                     session=session
                 )

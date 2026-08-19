@@ -90,6 +90,7 @@ class Action(Base):
     average_price = Column(Float, nullable=True)       # Executed average fill price
     last_reconciled_at = Column(DateTime, nullable=True)# Timestamp of last active broker status sync
     rejection_reason = Column(Text, nullable=True)     # Rejection / cancellation reason from broker RMS
+    error_category = Column(String, nullable=True, index=True) # Normalized operational error category ("MARKET_CLOSED", "MARGIN_EXHAUSTION", "CIRCUIT_LIMIT", "INVALID_INSTRUMENT", "AUTH_FAILURE")
     zerodha_order_id = Column(String, nullable=True)
     zerodha_response = Column(Text, nullable=True)
     placed_at = Column(DateTime, nullable=True)

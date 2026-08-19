@@ -95,6 +95,7 @@ def init_db():
             "average_price": "DOUBLE PRECISION",
             "last_reconciled_at": "TIMESTAMP",
             "rejection_reason": "TEXT",
+            "error_category": "VARCHAR",
             "zerodha_order_id": "VARCHAR",
             "zerodha_response": "TEXT",
             "placed_at": "TIMESTAMP",

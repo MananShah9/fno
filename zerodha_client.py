@@ -1,10 +1,11 @@
 import os
+import re
 import json
 import time
 import logging
 import urllib.parse
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 import requests
 import pyotp
 from kiteconnect import KiteConnect
@@ -13,6 +14,131 @@ from instruments_manager import get_spot_instrument_key, is_index_symbol, round_
 logger = logging.getLogger("zerodha")
 
 SESSION_FILE = os.path.join("sessions", "zerodha_session.json")
+
+
+class BrokerErrorCategory:
+    MARKET_CLOSED = "MARKET_CLOSED"
+    MARGIN_EXHAUSTION = "MARGIN_EXHAUSTION"
+    CIRCUIT_LIMIT = "CIRCUIT_LIMIT"
+    INVALID_INSTRUMENT = "INVALID_INSTRUMENT"
+    AUTH_FAILURE = "AUTH_FAILURE"
+    NETWORK_ERROR = "NETWORK_ERROR"
+    GENERAL_ERROR = "GENERAL_ERROR"
+
+
+BROKER_ERROR_CLASS_NAMES = {
+    BrokerErrorCategory.MARKET_CLOSED: "Market Closed",
+    BrokerErrorCategory.MARGIN_EXHAUSTION: "Margin Exhaustion",
+    BrokerErrorCategory.CIRCUIT_LIMIT: "Circuit Limit",
+    BrokerErrorCategory.INVALID_INSTRUMENT: "Invalid Instrument",
+    BrokerErrorCategory.AUTH_FAILURE: "Authorization Failure",
+    BrokerErrorCategory.NETWORK_ERROR: "Network Error",
+    BrokerErrorCategory.GENERAL_ERROR: "General Error"
+}
+
+AUTH_PATTERNS = re.compile(
+    r"(?i)\b(token(exception)?|permissionexception|unauthorized|forbidden|session\s*(is\s*)?(expired|invalid)|invalid\s*(token|api\s*key|session|credentials)|user\s*not\s*logged\s*in|access\s*denied|auth(entication)?\s*failed|401\s*unauthorized|403\s*forbidden|twofa|2fa|totp)\b"
+)
+
+MARKET_CLOSED_PATTERNS = re.compile(
+    r"(?i)(market(s)?\s*(is|are)?\s*closed|outside\s*(of\s*)?market\s*hours|outside\s*trading\s*hours|after\s*market\s*order|\bamo\b|option\s*strike\s*not\s*allowed\s*in\s*amo|not\s*allowed\s*in\s*amo|amo\s*order|use\s*gtt|gtt\s*for\s*placing|exchange\s*(is\s*)?closed|trading\s*(is\s*)?closed|post\s*close\s*session|market\s*close|closed\s*right\s*now|market\s*is\s*not\s*open|order\s*placement\s*is\s*closed|orders?\s*(can\s*only|cannot)\s*be\s*placed\s*during\s*market\s*close|orders?\s*cannot\s*be\s*placed\s*outside|market\s*closed\s*for\s*the\s*day)"
+)
+
+MARGIN_PATTERNS = re.compile(
+    r"(?i)(margin\s*(is\s*)?(insufficient|shortfall|exceeded|required)|insufficient\s*(funds|balance|margin)|fund\s*shortage|shortage\s*of\s*funds|rms:\s*margin|available\s*margin|not\s*(have\s*)?enough\s*margin|span\s*margin|exposure\s*margin|margin\s*balance|rms:rule:\s*margin|exceeds\s*margin|margin\s*limit)"
+)
+
+CIRCUIT_PATTERNS = re.compile(
+    r"(?i)(circuit\s*limit|daily\s*circuit|dpr\s*violation|daily\s*price\s*range|permitted\s*(operating\s*)?range|out\s*of\s*(permissible|permitted)\s*range|price\s*is\s*outside\s*(the\s*)?(daily\s*)?circuit|price\s*out\s*of\s*bounds|exceeds\s*daily\s*price\s*range|operating\s*range|circuit\s*range)"
+)
+
+INVALID_INSTRUMENT_PATTERNS = re.compile(
+    r"(?i)(instrument\s*(is\s*)?(disabled|blocked|invalid|expired)|disabled\s*for\s*trading|blocked\s*for\s*trading|trading\s*(is\s*)?blocked|contract\s*(has\s*)?expired|expired\s*(instrument|contract)|invalid\s*(trading\s*)?symbol|invalid\s*instrument|instrument\s*does\s*not\s*exist|instrument_token|strike\s*(is\s*)?(not\s*allowed|blocked|invalid)|option\s*strike.*(blocked|not\s*allowed)|illiquid\s*option|non-tradable|freeze\s*limit|maximum\s*(allowed\s*)?(order\s*)?quantity|quantity\s*exceeds|freeze\s*quantity)"
+)
+
+NETWORK_PATTERNS = re.compile(
+    r"(?i)(networkexception|connectionerror|connecttimeout|readtimeout|timeout|502\s*bad\s*gateway|503\s*service\s*unavailable|504\s*gateway|remote\s*disconnected|connection\s*reset|connection\s*refused)"
+)
+
+
+def classify_broker_error(error_or_msg: Any) -> Dict[str, Any]:
+    """
+    Normalizes broker API error codes and exception messages into distinct operational classes:
+      - MARKET_CLOSED ("Market Closed")
+      - MARGIN_EXHAUSTION ("Margin Exhaustion")
+      - CIRCUIT_LIMIT ("Circuit Limit")
+      - INVALID_INSTRUMENT ("Invalid Instrument")
+      - AUTH_FAILURE ("Authorization Failure")
+      - NETWORK_ERROR ("Network Error")
+      - GENERAL_ERROR ("General Error")
+    """
+    if error_or_msg is None:
+        return {
+            "category": BrokerErrorCategory.GENERAL_ERROR,
+            "error_class": BROKER_ERROR_CLASS_NAMES[BrokerErrorCategory.GENERAL_ERROR],
+            "message": "Unknown broker error",
+            "raw_error": "",
+            "is_market_closed": False,
+            "is_margin_exhaustion": False,
+            "is_circuit_limit": False,
+            "is_invalid_instrument": False,
+            "is_auth_failure": False,
+            "is_network_error": False,
+            "is_retryable": False
+        }
+
+    raw_str = str(error_or_msg).strip()
+    exc_type_name = error_or_msg.__class__.__name__ if isinstance(error_or_msg, Exception) else ""
+
+    category = None
+
+    # 1. Check kiteconnect exception types if available
+    if isinstance(error_or_msg, Exception):
+        try:
+            import kiteconnect.exceptions as ke
+            if isinstance(error_or_msg, (ke.TokenException, ke.PermissionException)):
+                category = BrokerErrorCategory.AUTH_FAILURE
+            elif isinstance(error_or_msg, ke.NetworkException):
+                category = BrokerErrorCategory.NETWORK_ERROR
+        except Exception:
+            pass
+
+    # 2. Check regex patterns on error text + exception class name
+    if not category:
+        text_to_check = f"{exc_type_name} {raw_str}"
+
+        if AUTH_PATTERNS.search(text_to_check):
+            category = BrokerErrorCategory.AUTH_FAILURE
+        elif MARKET_CLOSED_PATTERNS.search(text_to_check):
+            category = BrokerErrorCategory.MARKET_CLOSED
+        elif MARGIN_PATTERNS.search(text_to_check):
+            category = BrokerErrorCategory.MARGIN_EXHAUSTION
+        elif CIRCUIT_PATTERNS.search(text_to_check):
+            category = BrokerErrorCategory.CIRCUIT_LIMIT
+        elif INVALID_INSTRUMENT_PATTERNS.search(text_to_check):
+            category = BrokerErrorCategory.INVALID_INSTRUMENT
+        elif NETWORK_PATTERNS.search(text_to_check):
+            category = BrokerErrorCategory.NETWORK_ERROR
+        else:
+            category = BrokerErrorCategory.GENERAL_ERROR
+
+    error_class = BROKER_ERROR_CLASS_NAMES.get(category, "General Error")
+    is_retryable = category in [BrokerErrorCategory.NETWORK_ERROR]
+
+    return {
+        "category": category,
+        "error_class": error_class,
+        "message": raw_str or error_class,
+        "raw_error": raw_str,
+        "is_market_closed": category == BrokerErrorCategory.MARKET_CLOSED,
+        "is_margin_exhaustion": category == BrokerErrorCategory.MARGIN_EXHAUSTION,
+        "is_circuit_limit": category == BrokerErrorCategory.CIRCUIT_LIMIT,
+        "is_invalid_instrument": category == BrokerErrorCategory.INVALID_INSTRUMENT,
+        "is_auth_failure": category == BrokerErrorCategory.AUTH_FAILURE,
+        "is_network_error": category == BrokerErrorCategory.NETWORK_ERROR,
+        "is_retryable": is_retryable
+    }
+
 
 def get_proxy_dict():
     proxy_url = os.getenv("ZERODHA_PROXY_URL", "http://100.125.89.97:8888")
@@ -518,12 +644,15 @@ def get_zerodha_order_status(order_id: str) -> dict:
                         order_type=ord_type
                     )
 
+                    err_cat_info = classify_broker_error(status_msg) if is_failed and status_msg else None
                     return {
                         "success": not is_failed,
                         "confirmed": is_confirmed,
                         "status": mapped_status,
                         "raw_status": raw_status,
                         "status_message": status_msg,
+                        "error_category": err_cat_info["category"] if err_cat_info else None,
+                        "error_class": err_cat_info["error_class"] if err_cat_info else None,
                         "filled_quantity": filled_qty,
                         "pending_quantity": pending_qty,
                         "average_price": avg_price
@@ -554,12 +683,15 @@ def get_zerodha_order_status(order_id: str) -> dict:
                             order_type=ord_type
                         )
 
+                        err_cat_info = classify_broker_error(status_msg) if is_failed and status_msg else None
                         return {
                             "success": not is_failed,
                             "confirmed": is_confirmed,
                             "status": mapped_status,
                             "raw_status": raw_status,
                             "status_message": status_msg,
+                            "error_category": err_cat_info["category"] if err_cat_info else None,
+                            "error_class": err_cat_info["error_class"] if err_cat_info else None,
                             "filled_quantity": filled_qty,
                             "pending_quantity": pending_qty,
                             "average_price": avg_price
@@ -574,6 +706,8 @@ def get_zerodha_order_status(order_id: str) -> dict:
             "status": "OPEN_LIMIT",
             "raw_status": "OPEN",
             "status_message": "Order status OPEN (assumed)",
+            "error_category": None,
+            "error_class": None,
             "filled_quantity": 0,
             "pending_quantity": 0,
             "average_price": 0.0
@@ -581,12 +715,15 @@ def get_zerodha_order_status(order_id: str) -> dict:
 
     except Exception as e:
         logger.warning(f"Error checking order status for {order_id}: {e}")
+        err_cat_info = classify_broker_error(e)
         return {
             "success": True,
             "confirmed": True,
             "status": "OPEN_LIMIT",
             "raw_status": "OPEN",
             "status_message": str(e),
+            "error_category": err_cat_info["category"],
+            "error_class": err_cat_info["error_class"],
             "filled_quantity": 0,
             "pending_quantity": 0,
             "average_price": 0.0
@@ -636,10 +773,16 @@ def cancel_zerodha_order(order_id: str, variety: str = "regular") -> dict:
     """
     Cancels an open or trigger order on Zerodha Kite API.
     variety: 'regular' or 'amo'.
-    Returns dict: {"success": bool, "order_id": str, "message": str}
+    Returns dict: {"success": bool, "order_id": str, "message": str, "error_category": str|None, "error_class": str|None}
     """
     if not order_id:
-        return {"success": False, "order_id": None, "message": "Missing order_id"}
+        return {
+            "success": False,
+            "order_id": None,
+            "message": "Missing order_id",
+            "error_category": None,
+            "error_class": None
+        }
     try:
         kite = get_zerodha_client()
         clean_order_id = str(order_id).strip()
@@ -649,14 +792,19 @@ def cancel_zerodha_order(order_id: str, variety: str = "regular") -> dict:
         return {
             "success": True,
             "order_id": clean_order_id,
-            "message": f"Order {clean_order_id} cancelled successfully."
+            "message": f"Order {clean_order_id} cancelled successfully.",
+            "error_category": None,
+            "error_class": None
         }
     except Exception as e:
         logger.warning(f"Error cancelling Zerodha order {order_id}: {e}")
+        err_cat_info = classify_broker_error(e)
         return {
             "success": False,
             "order_id": str(order_id),
-            "message": str(e)
+            "message": str(e),
+            "error_category": err_cat_info["category"],
+            "error_class": err_cat_info["error_class"]
         }
 
 
@@ -806,8 +954,14 @@ def place_zerodha_order(
                         "success": False,
                         "order_id": None,
                         "status": "REJECTED",
+                        "raw_status": "REJECTED",
                         "message": err_msg,
-                        "status_message": err_msg
+                        "status_message": err_msg,
+                        "error_category": BrokerErrorCategory.INVALID_INSTRUMENT,
+                        "error_class": BROKER_ERROR_CLASS_NAMES[BrokerErrorCategory.INVALID_INSTRUMENT],
+                        "filled_quantity": 0,
+                        "pending_quantity": 0,
+                        "average_price": 0.0
                     }
 
         # Ensure limit prices and trigger prices are rounded to valid exchange tick size
@@ -821,9 +975,11 @@ def place_zerodha_order(
             dir_sl = "UP" if str(transaction_type).upper() == "BUY" else "DOWN"
             final_trigger_price = round_to_tick(trigger_price, tick_size=0.05, direction=dir_sl)
 
+        order_id = None
+        variety_used = kite.VARIETY_REGULAR
         try:
             order_id = kite.place_order(
-                variety=kite.VARIETY_REGULAR,
+                variety=variety_used,
                 exchange=exchange,
                 tradingsymbol=tradingsymbol,
                 transaction_type=tt,
@@ -835,25 +991,56 @@ def place_zerodha_order(
                 validity=validity
             )
         except Exception as reg_err:
-            err_msg = str(reg_err)
-            if "After Market Order" in err_msg or "AMO" in err_msg:
-                logger.info("Retrying order placement with VARIETY_AMO...")
-                order_id = kite.place_order(
-                    variety=kite.VARIETY_AMO,
-                    exchange=exchange,
-                    tradingsymbol=tradingsymbol,
-                    transaction_type=tt,
-                    quantity=int(quantity),
-                    product=prod,
-                    order_type=ot,
-                    price=final_price,
-                    trigger_price=final_trigger_price,
-                    validity=validity
-                )
+            err_cat_info = classify_broker_error(reg_err)
+            if err_cat_info["is_market_closed"]:
+                logger.info(f"Market closed condition detected ({reg_err}). Retrying order placement with VARIETY_AMO...")
+                variety_used = kite.VARIETY_AMO
+                try:
+                    order_id = kite.place_order(
+                        variety=kite.VARIETY_AMO,
+                        exchange=exchange,
+                        tradingsymbol=tradingsymbol,
+                        transaction_type=tt,
+                        quantity=int(quantity),
+                        product=prod,
+                        order_type=ot,
+                        price=final_price,
+                        trigger_price=final_trigger_price,
+                        validity=validity
+                    )
+                except Exception as amo_err:
+                    amo_cat_info = classify_broker_error(amo_err)
+                    logger.warning(f"AMO order placement also failed [{amo_cat_info['error_class']}]: {amo_err}")
+                    return {
+                        "success": False,
+                        "order_id": None,
+                        "status": "REJECTED" if amo_cat_info["is_market_closed"] or amo_cat_info["is_invalid_instrument"] else "FAILED",
+                        "raw_status": "REJECTED" if amo_cat_info["is_market_closed"] or amo_cat_info["is_invalid_instrument"] else "FAILED",
+                        "message": f"Order placement failed: {amo_err}",
+                        "status_message": str(amo_err),
+                        "error_category": amo_cat_info["category"],
+                        "error_class": amo_cat_info["error_class"],
+                        "filled_quantity": 0,
+                        "pending_quantity": 0,
+                        "average_price": 0.0
+                    }
             else:
-                raise reg_err
+                logger.error(f"Zerodha order placement failed [{err_cat_info['error_class']}]: {reg_err}")
+                return {
+                    "success": False,
+                    "order_id": None,
+                    "status": "REJECTED" if err_cat_info["category"] in [BrokerErrorCategory.MARGIN_EXHAUSTION, BrokerErrorCategory.CIRCUIT_LIMIT, BrokerErrorCategory.INVALID_INSTRUMENT] else "FAILED",
+                    "raw_status": "REJECTED" if err_cat_info["category"] in [BrokerErrorCategory.MARGIN_EXHAUSTION, BrokerErrorCategory.CIRCUIT_LIMIT, BrokerErrorCategory.INVALID_INSTRUMENT] else "FAILED",
+                    "message": f"Order placement failed: {reg_err}",
+                    "status_message": str(reg_err),
+                    "error_category": err_cat_info["category"],
+                    "error_class": err_cat_info["error_class"],
+                    "filled_quantity": 0,
+                    "pending_quantity": 0,
+                    "average_price": 0.0
+                }
 
-        logger.info(f"Order submitted to Zerodha. Order ID: {order_id}")
+        logger.info(f"Order submitted to Zerodha ({'AMO' if variety_used == kite.VARIETY_AMO else 'REGULAR'}). Order ID: {order_id}")
 
         status_name = "OPEN_LIMIT" if ot == kite.ORDER_TYPE_LIMIT else "SUBMITTED"
         raw_status = "OPEN" if ot == kite.ORDER_TYPE_LIMIT else "SUBMITTED"
@@ -873,7 +1060,8 @@ def place_zerodha_order(
 
             if status_name == "REJECTED" or raw_status == "REJECTED":
                 rej_reason = status_msg or "Rejected by Zerodha RMS"
-                logger.error(f"Zerodha RMS rejected order {order_id}: {rej_reason}")
+                err_cat_info = classify_broker_error(rej_reason)
+                logger.error(f"Zerodha RMS rejected order {order_id} [{err_cat_info['error_class']}]: {rej_reason}")
                 return {
                     "success": False,
                     "order_id": str(order_id),
@@ -881,13 +1069,16 @@ def place_zerodha_order(
                     "raw_status": raw_status,
                     "message": f"Order {order_id} rejected by Zerodha RMS: {rej_reason}",
                     "status_message": rej_reason,
+                    "error_category": err_cat_info["category"],
+                    "error_class": err_cat_info["error_class"],
                     "filled_quantity": filled_qty,
                     "pending_quantity": pending_qty,
                     "average_price": avg_price
                 }
             elif status_name == "CANCELLED" or raw_status == "CANCELLED":
                 can_reason = status_msg or "Order cancelled"
-                logger.error(f"Order {order_id} was cancelled: {can_reason}")
+                err_cat_info = classify_broker_error(can_reason)
+                logger.error(f"Order {order_id} was cancelled [{err_cat_info['error_class']}]: {can_reason}")
                 return {
                     "success": False,
                     "order_id": str(order_id),
@@ -895,6 +1086,8 @@ def place_zerodha_order(
                     "raw_status": raw_status,
                     "message": f"Order {order_id} cancelled: {can_reason}",
                     "status_message": can_reason,
+                    "error_category": err_cat_info["category"],
+                    "error_class": err_cat_info["error_class"],
                     "filled_quantity": filled_qty,
                     "pending_quantity": pending_qty,
                     "average_price": avg_price
@@ -907,6 +1100,8 @@ def place_zerodha_order(
             "raw_status": raw_status,
             "message": f"Order placed successfully. Order ID: {order_id}" + (f" ({status_name})" if status_name not in ["SUBMITTED", "OPEN"] else ""),
             "status_message": status_msg,
+            "error_category": None,
+            "error_class": None,
             "filled_quantity": filled_qty,
             "pending_quantity": pending_qty,
             "average_price": avg_price
@@ -914,6 +1109,7 @@ def place_zerodha_order(
 
     except Exception as e:
         logger.exception(f"Error placing Zerodha order: {e}")
+        err_cat_info = classify_broker_error(e)
         return {
             "success": False,
             "order_id": None,
@@ -921,6 +1117,8 @@ def place_zerodha_order(
             "raw_status": "FAILED",
             "message": str(e),
             "status_message": str(e),
+            "error_category": err_cat_info["category"],
+            "error_class": err_cat_info["error_class"],
             "filled_quantity": 0,
             "pending_quantity": 0,
             "average_price": 0.0
