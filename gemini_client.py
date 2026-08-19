@@ -7,7 +7,7 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-from instruments_manager import get_known_underlyings, is_index_symbol
+from instruments_manager import get_known_underlyings, is_index_symbol, round_to_tick, parse_price_value
 
 load_dotenv()
 
@@ -249,17 +249,7 @@ def classify_sl_trigger(
 
     clean_u = clean_symbol(underlying) or ""
     clean_ot = str(option_type).upper() if option_type else None
-    parsed_entry_price = None
-    if entry_price is not None:
-        try:
-            if isinstance(entry_price, (int, float)):
-                parsed_entry_price = float(entry_price)
-            else:
-                p_nums = re.findall(r'\d+(?:\.\d+)?', str(entry_price))
-                if p_nums:
-                    parsed_entry_price = float(p_nums[0]) if len(p_nums) == 1 else (float(p_nums[0]) + float(p_nums[1])) / 2.0
-        except Exception:
-            parsed_entry_price = None
+    parsed_entry_price = parse_price_value(entry_price) if entry_price is not None else None
 
     # Check for explicit spot keywords
     spot_keywords = [
@@ -355,9 +345,13 @@ def classify_sl_trigger(
                 # Long option: risk is when option premium drops
                 direction = "BELOW"
 
+    # Ensure trigger_val is rounded to valid exchange tick size (0.05)
+    tick_dir = "UP" if direction == "ABOVE" else ("DOWN" if direction == "BELOW" else None)
+    rounded_trigger_val = round_to_tick(trigger_val, tick_size=0.05, direction=tick_dir) if trigger_val is not None else None
+
     return {
         "sl_trigger_type": sl_type,
-        "sl_trigger_price": trigger_val,
+        "sl_trigger_price": rounded_trigger_val if rounded_trigger_val is not None else trigger_val,
         "sl_trigger_direction": direction,
         "raw_stoploss": sl_str,
         "reason": reason

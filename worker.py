@@ -18,7 +18,7 @@ from gemini_client import (
     is_emergency_exit_phrase, extract_exit_strikes_and_prices, ActionSchema
 )
 from instruments_manager import (
-    resolve_nfo_instrument, parse_price_value, calculate_lots_from_budget,
+    resolve_nfo_instrument, parse_price_value, round_to_tick, calculate_lots_from_budget,
     calculate_position_size, classify_strategy_type, get_margin_tier_estimate,
     get_max_lot_cap, is_index_symbol, get_spot_instrument_key
 )
@@ -229,7 +229,10 @@ def evaluate_and_deduplicate_adjustments(
     trade.last_adjustment_at = msg_date
     
     first_entry_act = entry_actions[0]
-    p_val = parse_price_value(getattr(first_entry_act, "price", None))
+    p_val = parse_price_value(
+        getattr(first_entry_act, "price", None),
+        direction=getattr(first_entry_act, "transaction_type", None) or getattr(first_entry_act, "action_type", None)
+    )
     if p_val:
         trade.last_adjustment_price = p_val
     if getattr(first_entry_act, "strike", None):
@@ -902,7 +905,10 @@ def process_trade_actions_and_sizing(
                     # Choose leg with highest price
                     best_price = -1.0
                     for i in entry_indices:
-                        p = parse_price_value(getattr(resolved_items[i]["schema"], "price", None)) or 0.0
+                        p = parse_price_value(
+                            getattr(resolved_items[i]["schema"], "price", None),
+                            direction=resolved_items[i]["action_type"]
+                        ) or 0.0
                         if p > best_price:
                             best_price = p
                             main_idx = i
@@ -912,7 +918,10 @@ def process_trade_actions_and_sizing(
         main_lot_size = main_inst["lot_size"] if main_inst else 1
 
         # 2. Determine price for main leg
-        main_price = parse_price_value(getattr(main_item["schema"], "price", None))
+        main_price = parse_price_value(
+            getattr(main_item["schema"], "price", None),
+            direction=main_item["action_type"]
+        )
         if (main_price is None or main_price <= 0) and main_inst:
             try:
                 main_price = get_nfo_ltp(main_inst.get("tradingsymbol"))
@@ -929,7 +938,10 @@ def process_trade_actions_and_sizing(
             for item in entry_legs_list:
                 leg_inst = item["inst"]
                 if leg_inst and leg_inst.get("tradingsymbol"):
-                    leg_price = parse_price_value(getattr(item["schema"], "price", None)) or 0.0
+                    leg_price = parse_price_value(
+                        getattr(item["schema"], "price", None),
+                        direction=item["action_type"]
+                    ) or 0.0
                     tt = getattr(item["schema"], "transaction_type", None) or item["action_type"]
                     if tt not in ["BUY", "SELL"]:
                         tt = "BUY" if item["action_type"] == "BUY" else "SELL"
@@ -1283,7 +1295,11 @@ def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = Fal
         limit_price = None
         if action.order_type == "LIMIT":
             if action.price:
-                limit_price = parse_price_value(action.price)
+                limit_price = parse_price_value(
+                    action.price,
+                    tick_size=0.05,
+                    direction=action.transaction_type or action.action_type
+                )
             if limit_price is None or limit_price <= 0:
                 logger.info(f"Action ID {action.id} has LIMIT order_type but unparseable price '{action.price}'. Converting to MARKET order.")
                 action.order_type = "MARKET"

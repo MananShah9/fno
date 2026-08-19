@@ -8,7 +8,7 @@ from typing import Optional, Dict, Any, List
 import requests
 import pyotp
 from kiteconnect import KiteConnect
-from instruments_manager import get_spot_instrument_key, is_index_symbol
+from instruments_manager import get_spot_instrument_key, is_index_symbol, round_to_tick, parse_price_value
 
 logger = logging.getLogger("zerodha")
 
@@ -626,6 +626,17 @@ def place_zerodha_order(
                         "status_message": err_msg
                     }
 
+        # Ensure limit prices and trigger prices are rounded to valid exchange tick size
+        final_price = None
+        if price is not None and ot == kite.ORDER_TYPE_LIMIT:
+            final_price = round_to_tick(price, tick_size=0.05, direction=transaction_type)
+
+        final_trigger_price = None
+        if trigger_price is not None and ot in [kite.ORDER_TYPE_SL, kite.ORDER_TYPE_SLM]:
+            # For BUY SL orders, round up; for SELL SL orders, round down
+            dir_sl = "UP" if str(transaction_type).upper() == "BUY" else "DOWN"
+            final_trigger_price = round_to_tick(trigger_price, tick_size=0.05, direction=dir_sl)
+
         try:
             order_id = kite.place_order(
                 variety=kite.VARIETY_REGULAR,
@@ -635,8 +646,8 @@ def place_zerodha_order(
                 quantity=int(quantity),
                 product=prod,
                 order_type=ot,
-                price=float(price) if (price and ot == kite.ORDER_TYPE_LIMIT) else None,
-                trigger_price=float(trigger_price) if (trigger_price and ot in [kite.ORDER_TYPE_SL, kite.ORDER_TYPE_SLM]) else None,
+                price=final_price,
+                trigger_price=final_trigger_price,
                 validity=validity
             )
         except Exception as reg_err:
@@ -651,8 +662,8 @@ def place_zerodha_order(
                     quantity=int(quantity),
                     product=prod,
                     order_type=ot,
-                    price=float(price) if (price and ot == kite.ORDER_TYPE_LIMIT) else None,
-                    trigger_price=float(trigger_price) if (trigger_price and ot in [kite.ORDER_TYPE_SL, kite.ORDER_TYPE_SLM]) else None,
+                    price=final_price,
+                    trigger_price=final_trigger_price,
                     validity=validity
                 )
             else:
@@ -731,6 +742,16 @@ def calculate_basket_margin(
             prod_val = getattr(kite, f"PRODUCT_{prod}", prod)
             variety_val = getattr(kite, "VARIETY_REGULAR", "regular")
 
+            final_p = 0.0
+            if o.get("price"):
+                parsed_p = round_to_tick(o.get("price"), tick_size=0.05, direction=tt)
+                final_p = float(parsed_p) if parsed_p is not None else 0.0
+
+            final_tp = 0.0
+            if o.get("trigger_price"):
+                parsed_tp = round_to_tick(o.get("trigger_price"), tick_size=0.05, direction="UP" if tt == "BUY" else "DOWN")
+                final_tp = float(parsed_tp) if parsed_tp is not None else 0.0
+
             formatted_orders.append({
                 "exchange": o.get("exchange", "NFO"),
                 "tradingsymbol": str(o.get("tradingsymbol", "")).strip().upper(),
@@ -739,8 +760,8 @@ def calculate_basket_margin(
                 "product": prod_val,
                 "order_type": ot_val,
                 "quantity": int(o.get("quantity", 1)),
-                "price": float(o.get("price", 0.0)) if o.get("price") else 0.0,
-                "trigger_price": float(o.get("trigger_price", 0.0)) if o.get("trigger_price") else 0.0
+                "price": final_p,
+                "trigger_price": final_tp
             })
 
         # Try basket_margins first (provides hedged margin calculation)

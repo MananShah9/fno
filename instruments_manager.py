@@ -2,7 +2,9 @@ import os
 import re
 import csv
 import io
+import math
 import logging
+from decimal import Decimal
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 import requests
@@ -243,37 +245,101 @@ def format_instrument_result(row: Dict[str, Any]) -> Dict[str, Any]:
         "exchange": row.get("exchange", "NFO")
     }
 
-def parse_price_value(price_val: Any) -> Optional[float]:
+def round_to_tick(
+    price: Optional[float],
+    tick_size: float = 0.05,
+    direction: Optional[str] = None
+) -> Optional[float]:
     """
-    Parses a price string, range, or number into a single float price.
+    Rounds a price or trigger price to the nearest valid exchange tick size (default 0.05 INR for Indian equity derivatives).
+    
+    Args:
+        price: Numeric price value
+        tick_size: Minimum price variation (tick size), defaults to 0.05
+        direction: 'BUY'/'DOWN'/'FLOOR'/'BID' to round down to nearest valid tick,
+                   'SELL'/'UP'/'CEIL'/'CEILING'/'ASK' to round up to nearest valid tick,
+                   or None/'NEAREST' for standard nearest tick rounding.
+                   
+    Returns:
+        float rounded to valid tick precision (e.g., 1.525 with BUY -> 1.50, with SELL -> 1.55)
+    """
+    if price is None:
+        return None
+    try:
+        val = float(price)
+        if val <= 0:
+            return None
+        if not tick_size or tick_size <= 0:
+            tick_size = 0.05
+        
+        # Calculate decimal precision of tick_size
+        try:
+            d = Decimal(str(tick_size)).normalize()
+            decimals = max(2, -d.as_tuple().exponent)
+        except Exception:
+            decimals = 2
+        
+        dir_norm = str(direction).strip().upper() if direction else ""
+        ticks = round(val / tick_size, 8)
+        
+        if dir_norm in ("BUY", "DOWN", "FLOOR", "BID"):
+            rounded_ticks = math.floor(ticks)
+        elif dir_norm in ("SELL", "UP", "CEIL", "CEILING", "ASK"):
+            rounded_ticks = math.ceil(ticks)
+        else:
+            rounded_ticks = round(ticks)
+            
+        result = round(rounded_ticks * tick_size, decimals)
+        return result
+    except (ValueError, TypeError, ZeroDivisionError):
+        return None
+
+def parse_price_value(
+    price_val: Any,
+    tick_size: float = 0.05,
+    direction: Optional[str] = None
+) -> Optional[float]:
+    """
+    Parses a price string, range, or number into a single float price rounded to valid exchange tick size.
     Examples:
       '183' -> 183.0
       '467-468' -> 467.5 (midpoint)
       '4.5-4.7' -> 4.6
+      '1.5-1.55' (BUY) -> 1.50
+      '1.5-1.55' (SELL) -> 1.55
       '@ 81' -> 81.0
       461.9 -> 461.9
     """
     if price_val is None:
         return None
+    
+    raw_val: Optional[float] = None
     if isinstance(price_val, (int, float)):
         try:
             val = float(price_val)
-            return val if val > 0 else None
+            if val > 0:
+                raw_val = val
         except (ValueError, TypeError):
             return None
-    
-    s = str(price_val).strip()
-    # Extract numeric portions (integers or decimals)
-    nums = re.findall(r'\d+(?:\.\d+)?', s)
-    if not nums:
+    else:
+        s = str(price_val).strip()
+        # Extract numeric portions (integers or decimals)
+        nums = re.findall(r'\d+(?:\.\d+)?', s)
+        if not nums:
+            return None
+        try:
+            if len(nums) == 1:
+                raw_val = float(nums[0])
+            else:
+                # If range like 467-468 or 1.5-1.55, return average of the first two numbers
+                raw_val = (float(nums[0]) + float(nums[1])) / 2.0
+        except (ValueError, TypeError):
+            return None
+
+    if raw_val is None or raw_val <= 0:
         return None
-    try:
-        if len(nums) == 1:
-            return float(nums[0])
-        # If range like 467-468 or 4.5-4.7, return average of the first two numbers
-        return (float(nums[0]) + float(nums[1])) / 2.0
-    except (ValueError, TypeError):
-        return None
+
+    return round_to_tick(raw_val, tick_size=tick_size, direction=direction)
 
 # Zerodha Kite Connect spot instrument quote key mappings for indices
 INDEX_SPOT_KEY_MAP = {
