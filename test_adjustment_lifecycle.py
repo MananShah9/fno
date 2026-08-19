@@ -20,6 +20,7 @@ from worker import (
 )
 from zerodha_client import get_zerodha_net_positions, verify_zerodha_positions_zero
 from gemini_client import TradeAnalysisSchema, ActionSchema
+from instruments_manager import resolve_nfo_instrument
 
 
 class TestTradeAdjustmentLifecycle(unittest.TestCase):
@@ -729,6 +730,113 @@ class TestTradeAdjustmentLifecycle(unittest.TestCase):
         self.assertFalse(res_err["all_zero"])
         self.assertFalse(res_err["verified"])
         self.assertIn("Could not verify Zerodha live positions", res_err["message"])
+
+    def test_trade_30_put_spread_exit_omitted_pe_resolution(self):
+        """
+        Verify Trade 30 scenario:
+        - Open position is a Put Spread: 24600 PE (SELL) and 24300 PE (BUY).
+        - Exit message omits letters 'PE': '24600 close at 93, 24300 close at 26'.
+        - AI / parser leaves option_type as None.
+        - process_trade_actions_and_sizing MUST cross-reference open positions,
+          inherit 'PE' for both legs, and resolve NIFTY...24600PE (BUY) and NIFTY...24300PE (SELL).
+        - STRICTLY FORBIDS resolving to CE Call options.
+        """
+        msg_entry = Message(id=300, text="DEPLOY NIFTY PUT SPREAD", date=datetime.utcnow())
+        self.session.add(msg_entry)
+        self.session.commit()
+
+        trade = Trade(id=30, underlying="NIFTY", structure_type="NIFTY PUT SPREAD", status="OPEN")
+        self.session.add(trade)
+        self.session.commit()
+
+        sell_pe = Action(
+            trade_id=trade.id,
+            message_id=msg_entry.id,
+            action_type="SELL",
+            transaction_type="SELL",
+            is_main=True,
+            tradingsymbol="NIFTY2681824600PE",
+            strike=24600.0,
+            option_type="PE",
+            instrument_token=123456,
+            quantity=65,
+            lots=1,
+            order_status="PLACED"
+        )
+        buy_pe = Action(
+            trade_id=trade.id,
+            message_id=msg_entry.id,
+            action_type="BUY",
+            transaction_type="BUY",
+            is_main=False,
+            tradingsymbol="NIFTY2681824300PE",
+            strike=24300.0,
+            option_type="PE",
+            instrument_token=234567,
+            quantity=65,
+            lots=1,
+            order_status="PLACED"
+        )
+        self.session.add_all([sell_pe, buy_pe])
+        self.session.commit()
+
+        exit_msg = Message(id=301, text="24600 close at 93, 24300 close at 26", date=datetime.utcnow())
+        self.session.add(exit_msg)
+        self.session.commit()
+
+        # Exit actions with omitted option_type (None)
+        parsed_actions = [
+            ActionSchema(action_type="EXIT", option_type=None, strike=24600.0, price="93", is_limit=True, underlying="NIFTY"),
+            ActionSchema(action_type="EXIT", option_type=None, strike=24300.0, price="26", is_limit=True, underlying="NIFTY")
+        ]
+
+        db_actions = process_trade_actions_and_sizing(trade, exit_msg.id, parsed_actions)
+        self.assertEqual(len(db_actions), 2)
+
+        # Leg 1: 24600 PE Exit
+        act_24600 = next(a for a in db_actions if a.strike == 24600.0)
+        self.assertEqual(act_24600.option_type, "PE")
+        self.assertEqual(act_24600.tradingsymbol, "NIFTY2681824600PE")
+        self.assertEqual(act_24600.instrument_token, 123456)
+        self.assertEqual(act_24600.transaction_type, "BUY")
+        self.assertEqual(act_24600.price, "93")
+        self.assertFalse(act_24600.tradingsymbol.endswith("CE"))
+
+        # Leg 2: 24300 PE Exit
+        act_24300 = next(a for a in db_actions if a.strike == 24300.0)
+        self.assertEqual(act_24300.option_type, "PE")
+        self.assertEqual(act_24300.tradingsymbol, "NIFTY2681824300PE")
+        self.assertEqual(act_24300.instrument_token, 234567)
+        self.assertEqual(act_24300.transaction_type, "SELL")
+        self.assertEqual(act_24300.price, "26")
+        self.assertFalse(act_24300.tradingsymbol.endswith("CE"))
+
+    def test_resolve_nfo_instrument_strictly_forbids_defaulting_to_ce(self):
+        """
+        Verify resolve_nfo_instrument behavior:
+        - When strike is specified and option_type is None, returns None (no arbitrary 'CE' fallback).
+        - When strike and option_type='PE' are specified, returns exact PE instrument.
+        - When strike and option_type='CE' are specified, returns exact CE instrument.
+        """
+        # Strike with None option_type -> MUST return None
+        res_none = resolve_nfo_instrument("NIFTY", strike=24600.0, option_type=None)
+        self.assertIsNone(res_none)
+
+        # Strike with empty string option_type -> MUST return None
+        res_empty = resolve_nfo_instrument("NIFTY", strike=24600.0, option_type="")
+        self.assertIsNone(res_empty)
+
+        # Strike with explicit 'PE' -> resolves PE
+        res_pe = resolve_nfo_instrument("NIFTY", strike=24600.0, option_type="PE")
+        self.assertIsNotNone(res_pe)
+        self.assertEqual(res_pe["instrument_type"], "PE")
+        self.assertTrue(res_pe["tradingsymbol"].endswith("PE"))
+
+        # Strike with explicit 'CE' -> resolves CE
+        res_ce = resolve_nfo_instrument("NIFTY", strike=24600.0, option_type="CE")
+        self.assertIsNotNone(res_ce)
+        self.assertEqual(res_ce["instrument_type"], "CE")
+        self.assertTrue(res_ce["tradingsymbol"].endswith("CE"))
 
 
 if __name__ == "__main__":

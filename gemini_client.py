@@ -7,6 +7,7 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+from instruments_manager import get_known_underlyings, is_index_symbol
 
 load_dotenv()
 
@@ -27,7 +28,19 @@ def get_genai_client() -> Optional[genai.Client]:
 if not api_key or api_key == "your_gemini_api_key":
     logger.warning("GEMINI_API_KEY is not set in environment!")
 
-KNOWN_TICKERS = ["BANKNIFTY", "MIDCPNIFTY", "FINNIFTY", "NIFTY", "SENSEX", "BANKEX", "VBL", "INDIGO", "TATASTEEL", "RELIANCE", "NATIONALUM"]
+def get_known_tickers() -> List[str]:
+    """
+    Returns a dynamically loaded list of known derivative underlyings and indices
+    parsed from the daily NSE NFO instruments master database.
+    """
+    try:
+        return get_known_underlyings()
+    except Exception as e:
+        logger.warning(f"Error loading dynamic known underlyings: {e}")
+        return ["BANKNIFTY", "MIDCPNIFTY", "FINNIFTY", "NIFTY", "SENSEX", "BANKEX", "VBL", "INDIGO", "TATASTEEL", "RELIANCE", "NATIONALUM"]
+
+# Dynamically loaded known tickers (sorted by length descending for prefix priority)
+KNOWN_TICKERS = get_known_tickers()
 
 EMERGENCY_EXIT_PATTERNS = [
     # 1. Unconditional full / all / entire position exits & closures
@@ -41,8 +54,11 @@ EMERGENCY_EXIT_PATTERNS = [
     r'\b(?:sl|stoploss|stop\s*loss|target)\s+hit\b',
     # 3. Profit booking unconditional triggers
     r'\b(?:profit\s*booking\s*in\s*this\s*trade|book\s*profit\s*in\s*this\s*trade|book\s*(?:full\s*)?profit\s*(?:now|here)?|book\s+and\s+exit)\b',
-    # 4. Multi-leg / strike exit instructions (e.g. "Exit 24600 at 93, 24300 at 26" or "Close 24600 Sell leg")
+    # 4. Multi-leg / strike exit instructions (e.g. "Exit 24600 at 93, 24300 at 26", "24600 close at 93, 24300 close at 26", "Close 24600 Sell leg")
     r'\b(?:exit|close|book)\s+\d{4,6}(?:\s*(?:ce|pe|call|put))?\s+at\s+\d+',
+    r'\b\d{4,6}(?:\s*(?:ce|pe|call|put|fut))?\s+(?:close|exit|book)\s+(?:at\s+)?\d+',
+    r'\b\d{4,6}(?:\s*(?:ce|pe|call|put|fut))?\s+(?:close|exit|book)\s+(?:sell|buy|hedge)?\s*leg\b',
+    r'\b\d{4,6}\s*(?:close|exit)\s+at\s+\d+',
     r'\b(?:close|exit|book)\s+\d{4,6}\s*(?:ce|pe|call|put)?\s+(?:sell|buy|hedge)?\s*leg\b',
     r'\b(?:close|exit|book)\s+(?:sell|buy|hedge)\s+leg\b',
     r'\b(?:close\s+future\s+position|close\s+fut\s+position|close\s+call\s+position|close\s+put\s+position)\b',
@@ -53,7 +69,7 @@ def is_emergency_exit_phrase(text: Optional[str]) -> bool:
     """
     Checks if a message contains high-urgency or unconditional exit keywords
     (e.g., 'EXIT FULL POSITION NOW', 'Close full position', 'Exit 24600 at 93, 24300 at 26',
-    'SL hit Exit full position', 'Square off all', 'Book profit in this trade').
+    '24600 close at 93, 24300 close at 26', 'SL hit Exit full position', 'Square off all', 'Book profit in this trade').
     """
     if not text:
         return False
@@ -66,7 +82,8 @@ def is_emergency_exit_phrase(text: Optional[str]) -> bool:
 def extract_exit_strikes_and_prices(text: Optional[str]) -> List[Dict[str, Any]]:
     """
     Extracts strike prices, option types, and target exit limit prices from exit messages
-    such as 'Exit 24600 at 93, 24300 at 26' or 'Close 24600 Sell leg Close 24300 Hedge leg'.
+    such as 'Exit 24600 at 93, 24300 at 26', '24600 close at 93, 24300 close at 26', or
+    'Close 24600 Sell leg Close 24300 Hedge leg'.
     Returns a list of dicts with extracted leg parameters.
     """
     if not text:
@@ -75,9 +92,9 @@ def extract_exit_strikes_and_prices(text: Optional[str]) -> List[Dict[str, Any]]
     cleaned = text.strip()
     results = []
     
-    # 1. Pattern: "Exit 24600 at 93", "Close 24600 PE at 93", "24300 at 26", "Book 24150 PE at 35-36"
+    # 1. Pattern: "Exit 24600 at 93", "Close 24600 PE at 93", "24600 close at 93", "24300 at 26", "Book 24150 PE at 35-36"
     p1 = re.finditer(
-        r'(?:exit|close|book|square\s*off)?\s*(\d{4,6})(?:\s*(pe|ce|call|put|fut))?\s*(?:sell|buy|hedge)?\s*(?:leg)?\s*(?:at|@)\s*(\d+(?:\.\d+)?(?:\s*-\s*\d+(?:\.\d+)?)?)',
+        r'(?:exit|close|book|square\s*off)?\s*(\d{4,6})(?:\s*(pe|ce|call|put|fut))?\s*(?:sell|buy|hedge)?\s*(?:leg)?\s*(?:at|@|close\s*at|exit\s*at)\s*(\d+(?:\.\d+)?(?:\s*-\s*\d+(?:\.\d+)?)?)',
         cleaned,
         re.IGNORECASE
     )
@@ -150,17 +167,24 @@ def clean_symbol(symbol: Optional[str]) -> Optional[str]:
     if not symbol:
         return None
     s = str(symbol).strip().upper()
-    # Check known tickers first
-    for t in KNOWN_TICKERS:
-        if s.startswith(t):
+    tickers = get_known_tickers()
+    
+    # 1. Exact match or delimited prefix match against known underlyings (longest first)
+    for t in tickers:
+        if s == t:
             return t
-    # Strip any trailing words, brackets, or suffixes
+        escaped_t = re.escape(t)
+        pattern = rf'^{escaped_t}(?:[\s_\-\(\):/\.@0-9]|FUT|CE|PE|EQ|JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC|$)'
+        if re.match(pattern, s, re.IGNORECASE):
+            return t
+            
+    # 2. Fallback for unlisted/raw symbols: strip trailing annotations
     s = re.sub(r'[\s_\-\(\)].*$', '', s)
-    match = re.search(r'^[A-Z0-9]+', s)
+    match = re.search(r'^[A-Z0-9&]+', s)
     if match:
         clean = match.group(0)
-        for t in KNOWN_TICKERS:
-            if clean.startswith(t):
+        for t in tickers:
+            if clean == t:
                 return t
         return clean
     return s[:20]
@@ -224,7 +248,7 @@ def classify_sl_trigger(
         trigger_val = float(nums[-1])
 
     clean_u = clean_symbol(underlying) or ""
-    clean_ot = str(option_type or "CE").upper()
+    clean_ot = str(option_type).upper() if option_type else None
     parsed_entry_price = None
     if entry_price is not None:
         try:
@@ -252,7 +276,7 @@ def classify_sl_trigger(
     has_spot_keyword = any(k in full_text for k in spot_keywords)
     has_option_keyword = any(k in full_text for k in option_keywords)
 
-    is_index = any(clean_u.startswith(idx) for idx in ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX"])
+    is_index = is_index_symbol(clean_u)
 
     # Classification Heuristics
     sl_type = "OPTION_PREMIUM_TRIGGER"
@@ -470,11 +494,15 @@ CRITICAL CONSTRAINTS:
        Set `is_valid_trade_msg = True`, `is_continuation = True`, `is_adjustment = True`, `is_adjustment_reminder = True`, and `related_open_trade_id` to the matching open trade. If the message is a status check or reminder of the same averaging window, set `action_type = 'INFO'` or set `is_adjustment = True` so downstream state machine prevents duplicate lot creation.
    - When a message updates target or stoploss for an existing leg, set `is_valid_trade_msg = True`, `is_continuation = True`, `related_open_trade_id` to the matching open trade, and `action_type = 'UPDATE_SL'`.
 7. Trade Exits, Profit Booking, and Urgent/Ticker-Omitted Exits:
-   - When an alert instructs to close/exit or book profit (e.g. "EXIT FULL POSITION NOW", "Close full position", "Exit full", "Close full", "SL hit Exit full position", "Exit 24600 at 93, 24300 at 26", "Close future position at ... All call at ... We are closing the trade", "PROFIT BOOKING IN THIS TRADE Close [strike] Sell leg Close [strike] Hedge leg", "Exit 24000 PE at 90", "Book 24150 PE at 35-36", "Square off all positions"):
-     - CRITICAL: IF THE TICKER IS NOT EXPLICITLY MENTIONED IN THE TEXT (e.g. "EXIT FULL POSITION NOW", "Close full position", "Exit 24600 at 93, 24300 at 26"):
+   - When an alert instructs to close/exit or book profit (e.g. "EXIT FULL POSITION NOW", "Close full position", "Exit full", "Close full", "SL hit Exit full position", "Exit 24600 at 93, 24300 at 26", "24600 close at 93, 24300 close at 26", "Close future position at ... All call at ... We are closing the trade", "PROFIT BOOKING IN THIS TRADE Close [strike] Sell leg Close [strike] Hedge leg", "Exit 24000 PE at 90", "Book 24150 PE at 35-36", "Square off all positions"):
+     - CRITICAL: IF THE TICKER IS NOT EXPLICITLY MENTIONED IN THE TEXT (e.g. "EXIT FULL POSITION NOW", "Close full position", "Exit 24600 at 93, 24300 at 26", "24600 close at 93, 24300 close at 26"):
        * You MUST inspect 'Open Trades Context'. If exactly ONE open trade exists (or strikes in the message match an open trade's existing orders), YOU MUST MAP THIS MESSAGE TO THAT OPEN TRADE!
        * Set `is_valid_trade_msg = True`, `is_continuation = True`, `related_open_trade_id` = open trade id, `underlying` = open trade underlying ticker, `structure_type` = open trade structure type, and `trade_status_update = 'CLOSED'`.
        * NEVER mark an urgent exit or unconditional exit message as `is_valid_trade_msg = False` or non-trade informational chat when active open trades exist!
+     - CRITICAL OPTION TYPE INHERITANCE ON EXITS:
+       * When exit messages list strikes without specifying CE or PE (e.g. "24600 close at 93, 24300 close at 26", "Exit 24600 at 93, 24300 at 26"), you MUST cross-reference the active open positions in 'Open Trades Context' for the matching trade by strike price.
+       * Inherit the exact `option_type` ('PE', 'CE', or 'FUT') from the matching open leg.
+       * STRICTLY NEVER leave `option_type` null or guess/default to 'CE' for exit actions when active open legs exist.
      - Set `trade_status_update = 'CLOSED'`.
      - Extract `action_type = 'EXIT'` for each leg. If specific strikes/prices are mentioned, create an ActionSchema for each with `action_type = 'EXIT'`. If no strikes are mentioned (e.g. "EXIT FULL POSITION NOW"), extract exit actions for all open legs from the Open Trades Context or leave actions for downstream square-off.
      - For `transaction_type` on EXIT actions:
@@ -483,6 +511,108 @@ CRITICAL CONSTRAINTS:
 8. Non-Trade Messages:
    - General market discussion, disclaimer notices, motivational chats, or poke/ping notifications (e.g. '.', 'trade incoming', '...') that contain NO actionable entry/exit/SL instructions should set `is_valid_trade_msg = False`. BUT ANY emergency exit or unconditional close instruction ("EXIT FULL POSITION NOW", "Close full position") is strictly actionable and MUST NOT be classified as non-trade!
 """
+
+def _format_strike_str(val: Any) -> str:
+    """Helper to cleanly format strike values as clean ints or floats."""
+    if val is None:
+        return "N/A"
+    try:
+        f = float(val)
+        return str(int(f)) if f.is_integer() else str(f)
+    except (ValueError, TypeError):
+        return str(val)
+
+
+def format_open_trades_context(open_trades: Optional[List[Dict[str, Any]]]) -> str:
+    """
+    Structures open trade context into a minimal tabular format containing only active open legs:
+    Trade ID, Underlying, Strategy Type, Tradingsymbol, Strike, Option Type, Side, and Role.
+
+    Excludes historical closed actions, full timestamps, and extraneous metadata from the LLM prompt context
+    to minimize latency and eliminate hallucinated trade cross-contamination.
+    """
+    if not open_trades:
+        return "No active open positions."
+
+    rows = []
+    for trade in open_trades:
+        trade_id = trade.get("id") or "N/A"
+        underlying = clean_symbol(trade.get("underlying")) or trade.get("underlying") or "N/A"
+        structure_type = trade.get("structure_type") or "N/A"
+
+        legs = trade.get("active_legs") or trade.get("existing_orders") or []
+        # Filter active legs if raw/unfiltered legacy dicts were passed
+        valid_legs = []
+        for leg in legs:
+            if not isinstance(leg, dict):
+                continue
+            act_type = str(leg.get("action_type") or "").upper()
+            status = str(leg.get("order_status") or "").upper()
+            if status in ["FAILED", "CANCELLED"]:
+                continue
+            if act_type in ["EXIT", "CLOSE_LEG", "UPDATE_SL", "INFO"]:
+                continue
+            valid_legs.append(leg)
+
+        if not valid_legs:
+            rows.append(f"| {trade_id} | {underlying} | {structure_type} | N/A | - | - | - | - |")
+        else:
+            for leg in valid_legs:
+                tradingsymbol = leg.get("tradingsymbol") or leg.get("instrument_name") or "N/A"
+                raw_strike = leg.get("strike")
+                strike_str = _format_strike_str(raw_strike)
+
+                ot = leg.get("option_type")
+                if not ot:
+                    if tradingsymbol != "N/A":
+                        sym_u = str(tradingsymbol).strip().upper()
+                        if sym_u.endswith("PE"):
+                            ot = "PE"
+                        elif sym_u.endswith("CE"):
+                            ot = "CE"
+                        elif sym_u.endswith("FUT") or "FUT" in sym_u:
+                            ot = "FUT"
+                    if not ot and structure_type != "N/A":
+                        st_u = str(structure_type).upper()
+                        if "PE" in st_u or "PUT" in st_u:
+                            ot = "PE"
+                        elif "CE" in st_u or "CALL" in st_u:
+                            ot = "CE"
+                        elif "FUT" in st_u:
+                            ot = "FUT"
+                ot_str = ot or "N/A"
+
+                raw_tt = leg.get("transaction_type") or leg.get("action_type") or leg.get("position_side") or "N/A"
+                tt_str = str(raw_tt).upper()
+                if tt_str == "LONG":
+                    side = "BUY"
+                elif tt_str == "SHORT":
+                    side = "SELL"
+                elif tt_str in ["BUY", "SELL"]:
+                    side = tt_str
+                else:
+                    side = "N/A"
+
+                is_main = leg.get("is_main")
+                if is_main is True:
+                    role = "Main"
+                elif is_main is False:
+                    role = "Hedge"
+                elif side == "SELL":
+                    role = "Main"
+                elif side == "BUY":
+                    role = "Hedge"
+                else:
+                    role = "N/A"
+
+                rows.append(f"| {trade_id} | {underlying} | {structure_type} | {tradingsymbol} | {strike_str} | {ot_str} | {side} | {role} |")
+
+    header = (
+        "| Trade ID | Underlying | Strategy Type | Tradingsymbol | Strike | Option Type | Side | Role |\n"
+        "|---|---|---|---|---|---|---|---|\n"
+    )
+    return header + "\n".join(rows)
+
 
 def analyze_message_with_ai(message_text: str, open_trades: List[Dict[str, Any]]) -> Optional[TradeAnalysisSchema]:
     """
@@ -504,8 +634,8 @@ def analyze_message_with_ai(message_text: str, open_trades: List[Dict[str, Any]]
     current_model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
     try:
-        # Structure the context
-        context_str = json.dumps(open_trades, indent=2, default=str)
+        # Structure the open trade context into a minimal tabular format
+        context_str = format_open_trades_context(open_trades)
         
         prompt = f"""
 Incoming Telegram Message to process:
@@ -648,40 +778,41 @@ INSTRUCTIONS:
                         act["sl_trigger_direction"] = classified_sl["sl_trigger_direction"]
 
         # Post-processing recovery: Check for emergency/unconditional exit phrases
-        if is_emergency_exit_phrase(message_text) and open_trades:
-            target_trade = None
+        target_trade = None
+        if open_trades:
             if len(open_trades) == 1:
                 target_trade = open_trades[0]
             else:
-                msg_nums = re.findall(r'\b\d{4,6}\b', message_text)
+                msg_nums = re.findall(r'\b\d{4,6}(?:\.\d+)?\b', message_text)
                 if msg_nums:
                     msg_strikes = [float(n) for n in msg_nums]
                     for ot in open_trades:
+                        legs = ot.get("active_legs") or ot.get("existing_orders") or []
                         ot_strikes = [
                             float(ord_item.get("strike"))
-                            for ord_item in ot.get("existing_orders", [])
-                            if ord_item.get("strike") is not None
+                            for ord_item in legs
+                            if isinstance(ord_item, dict) and ord_item.get("strike") is not None
                         ]
                         if any(s in ot_strikes for s in msg_strikes):
                             target_trade = ot
                             break
 
-            if target_trade:
-                if not result_json.get("is_valid_trade_msg") or not result_json.get("related_open_trade_id"):
-                    logger.info(
-                        f"AI analysis post-process: Identified emergency/unconditional exit message ('{message_text.strip()}') "
-                        f"mapped to Open Trade #{target_trade.get('id')} ({target_trade.get('underlying')}). Overriding classification."
-                    )
-                    result_json["is_valid_trade_msg"] = True
-                    result_json["is_continuation"] = True
-                    result_json["trade_status_update"] = "CLOSED"
-                    result_json["related_open_trade_id"] = target_trade.get("id")
-                    if not result_json.get("underlying"):
-                        result_json["underlying"] = target_trade.get("underlying")
-                    if not result_json.get("structure_type"):
-                        result_json["structure_type"] = target_trade.get("structure_type")
-                    if not result_json.get("context_summary"):
-                        result_json["context_summary"] = f"Emergency exit: Closing full position for Trade #{target_trade.get('id')} ({target_trade.get('underlying')})"
+        if is_emergency_exit_phrase(message_text) and target_trade:
+            if not result_json.get("is_valid_trade_msg") or not result_json.get("related_open_trade_id"):
+                logger.info(
+                    f"AI analysis post-process: Identified emergency/unconditional exit message ('{message_text.strip()}') "
+                    f"mapped to Open Trade #{target_trade.get('id')} ({target_trade.get('underlying')}). Overriding classification."
+                )
+                result_json["is_valid_trade_msg"] = True
+                result_json["is_continuation"] = True
+                result_json["trade_status_update"] = "CLOSED"
+                result_json["related_open_trade_id"] = target_trade.get("id")
+                if not result_json.get("underlying"):
+                    result_json["underlying"] = target_trade.get("underlying")
+                if not result_json.get("structure_type"):
+                    result_json["structure_type"] = target_trade.get("structure_type")
+                if not result_json.get("context_summary"):
+                    result_json["context_summary"] = f"Emergency exit: Closing full position for Trade #{target_trade.get('id')} ({target_trade.get('underlying')})"
 
         # If actions is empty and strikes/prices were in the emergency exit message, populate them
         if is_emergency_exit_phrase(message_text) and not result_json.get("actions"):
@@ -689,17 +820,37 @@ INSTRUCTIONS:
             if extracted_legs:
                 u_for_leg = result_json.get("underlying")
                 for leg in extracted_legs:
+                    leg_ot = leg.get("option_type")
+                    if not leg_ot and target_trade:
+                        legs = target_trade.get("active_legs") or target_trade.get("existing_orders") or []
+                        for ord_item in legs:
+                            if isinstance(ord_item, dict) and ord_item.get("strike") is not None and leg.get("strike") is not None:
+                                if abs(float(ord_item["strike"]) - float(leg["strike"])) < 0.01:
+                                    leg_ot = ord_item.get("option_type")
+                                    break
                     result_json["actions"].append({
                         "action_type": "EXIT",
                         "underlying": u_for_leg,
                         "strike": leg["strike"],
-                        "option_type": leg.get("option_type"),
+                        "option_type": leg_ot,
                         "price": leg.get("price"),
                         "is_limit": bool(leg.get("price")),
                         "order_type": "LIMIT" if leg.get("price") else "MARKET",
                         "is_main": leg.get("is_main", True),
                         "lots": 1
                     })
+
+        # Cross-reference existing orders to populate missing option_type on any exit actions
+        if target_trade and "actions" in result_json and isinstance(result_json["actions"], list):
+            for act in result_json["actions"]:
+                if isinstance(act, dict) and act.get("action_type") in ["EXIT", "CLOSE_LEG"]:
+                    if not act.get("option_type") and act.get("strike") is not None:
+                        legs = target_trade.get("active_legs") or target_trade.get("existing_orders") or []
+                        for ord_item in legs:
+                            if isinstance(ord_item, dict) and ord_item.get("strike") is not None:
+                                if abs(float(ord_item["strike"]) - float(act["strike"])) < 0.01:
+                                    act["option_type"] = ord_item.get("option_type")
+                                    break
 
         return TradeAnalysisSchema(**result_json)
 

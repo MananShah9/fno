@@ -624,6 +624,128 @@ class TestEmergencyExit(unittest.TestCase):
         self.assertEqual(trade1.status, "CLOSED")
         self.assertEqual(trade2.status, "OPEN")
 
+    @patch("gemini_client.get_genai_client")
+    def test_trade_30_exact_closing_message_inherits_pe_and_closes_put_spread(self, mock_get_client):
+        """
+        Simulate the exact Trade 30 production scenario:
+        - Open trade #30: NIFTY Put Spread (24600 PE SELL, 24300 PE BUY).
+        - Telegram message: '24600 close at 93, 24300 close at 26' (omits 'PE').
+        - Pipeline processes message:
+          1. AI analysis / post-processing extracts strikes 24600 & 24300 with prices 93 & 26.
+          2. Maps message to Trade #30.
+          3. process_trade_actions_and_sizing cross-references open positions and inherits PE.
+          4. Resolves NIFTY...24600PE (BUY) and NIFTY...24300PE (SELL).
+          5. Strictly forbids defaulting to CE (no Call options bought).
+          6. Updates Trade #30 to CLOSED.
+        """
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+
+        mock_parsed = TradeAnalysisSchema(
+            is_valid_trade_msg=False,  # Simulate AI failing to identify ticker in text
+            actions=[],
+            trade_status_update="OPEN"
+        )
+        mock_response = MagicMock()
+        mock_response.candidates = [MagicMock()]
+        mock_response.parsed = mock_parsed
+        mock_response.text = None
+        mock_client.models.generate_content.return_value = mock_response
+
+        # Setup Open Trade 30
+        trade = Trade(
+            id=30,
+            status="OPEN",
+            underlying="NIFTY",
+            structure_type="NIFTY BULL PUT SPREAD",
+            opened_at=datetime.utcnow()
+        )
+        self.session.add(trade)
+        self.session.commit()
+
+        entry_msg = Message(id=30, telegram_message_id=30, text="DEPLOY NIFTY PUT SPREAD", date=datetime.utcnow())
+        self.session.add(entry_msg)
+        self.session.commit()
+
+        sell_pe = Action(
+            trade_id=trade.id,
+            message_id=entry_msg.id,
+            action_type="SELL",
+            transaction_type="SELL",
+            is_main=True,
+            underlying="NIFTY",
+            strike=24600.0,
+            option_type="PE",
+            tradingsymbol="NIFTY2681824600PE",
+            instrument_token=1001,
+            quantity=65,
+            lots=1,
+            order_status="PLACED"
+        )
+        buy_pe = Action(
+            trade_id=trade.id,
+            message_id=entry_msg.id,
+            action_type="BUY",
+            transaction_type="BUY",
+            is_main=False,
+            underlying="NIFTY",
+            strike=24300.0,
+            option_type="PE",
+            tradingsymbol="NIFTY2681824300PE",
+            instrument_token=1002,
+            quantity=65,
+            lots=1,
+            order_status="PLACED"
+        )
+        self.session.add_all([sell_pe, buy_pe])
+        self.session.commit()
+
+        # Incoming exit message: "24600 close at 93, 24300 close at 26"
+        exit_msg = Message(
+            id=31,
+            telegram_message_id=31,
+            text="24600 close at 93, 24300 close at 26",
+            date=datetime.utcnow(),
+            processed=False,
+            analysed_by_ai=False
+        )
+        self.session.add(exit_msg)
+        self.session.commit()
+
+        import asyncio
+        success = asyncio.run(process_single_message(self.session, exit_msg))
+        self.assertTrue(success)
+
+        self.session.refresh(trade)
+        self.assertEqual(trade.status, "CLOSED")
+
+        # Verify exit actions
+        exit_actions = self.session.query(Action).filter(
+            Action.message_id == exit_msg.id,
+            Action.action_type == "EXIT"
+        ).all()
+        self.assertEqual(len(exit_actions), 2)
+
+        # Verify leg 24600: PE, BUY, NIFTY2681824600PE (NOT CE)
+        act_24600 = next(a for a in exit_actions if a.strike == 24600.0)
+        self.assertEqual(act_24600.option_type, "PE")
+        self.assertEqual(act_24600.tradingsymbol, "NIFTY2681824600PE")
+        self.assertEqual(act_24600.instrument_token, 1001)
+        self.assertEqual(act_24600.transaction_type, "BUY")
+        self.assertEqual(act_24600.price, "93")
+        self.assertEqual(act_24600.order_type, "LIMIT")
+        self.assertFalse(act_24600.tradingsymbol.endswith("CE"))
+
+        # Verify leg 24300: PE, SELL, NIFTY2681824300PE (NOT CE)
+        act_24300 = next(a for a in exit_actions if a.strike == 24300.0)
+        self.assertEqual(act_24300.option_type, "PE")
+        self.assertEqual(act_24300.tradingsymbol, "NIFTY2681824300PE")
+        self.assertEqual(act_24300.instrument_token, 1002)
+        self.assertEqual(act_24300.transaction_type, "SELL")
+        self.assertEqual(act_24300.price, "26")
+        self.assertEqual(act_24300.order_type, "LIMIT")
+        self.assertFalse(act_24300.tradingsymbol.endswith("CE"))
+
 
 if __name__ == "__main__":
     unittest.main()

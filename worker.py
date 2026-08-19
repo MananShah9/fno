@@ -48,49 +48,6 @@ logger = logging.getLogger("worker")
 
 AUTO_PLACE_ORDERS = os.getenv("AUTO_PLACE_ORDERS", "false").lower() in ("true", "1", "t", "yes")
 
-def get_open_trades_context(session: Session):
-    """Fetches all open trades formatted as context for Gemini."""
-    open_trades = session.query(Trade).filter(Trade.status == "OPEN").all()
-    
-    context = []
-    for trade in open_trades:
-        actions_list = []
-        for action in trade.actions:
-            actions_list.append({
-                "action_type": action.action_type,
-                "instrument_name": action.instrument_name,
-                "tradingsymbol": action.tradingsymbol,
-                "transaction_type": action.transaction_type,
-                "is_adjustment": getattr(action, "is_adjustment", False) or False,
-                "lots": action.lots,
-                "quantity": action.quantity,
-                "price": action.price,
-                "stoploss": action.stoploss,
-                "sl_trigger_type": getattr(action, "sl_trigger_type", None),
-                "sl_trigger_price": getattr(action, "sl_trigger_price", None),
-                "sl_trigger_direction": getattr(action, "sl_trigger_direction", None),
-                "sl_monitoring_active": getattr(action, "sl_monitoring_active", False) or False,
-                "target": action.target,
-                "details": action.details
-            })
-            
-        clean_u = clean_symbol(trade.underlying)
-        summary = (trade.context_summary or "")[:200]
-        context.append({
-            "id": trade.id,
-            "status": trade.status,
-            "structure_type": trade.structure_type,
-            "underlying": clean_u,
-            "opened_at": trade.opened_at.isoformat() if trade.opened_at else None,
-            "context_summary": summary,
-            "adjustment_count": trade.adjustment_count or 0,
-            "max_adjustments": trade.max_adjustments if trade.max_adjustments is not None else 1,
-            "last_adjustment_at": trade.last_adjustment_at.isoformat() if trade.last_adjustment_at else None,
-            "last_adjustment_price": trade.last_adjustment_price,
-            "existing_orders": actions_list
-        })
-    return context
-
 def is_adjustment_planning_text(text: Optional[str]) -> bool:
     """Checks if message is forward-looking planning commentary (e.g. 'planning to average')."""
     if not text:
@@ -586,6 +543,93 @@ def compute_trade_net_positions(session: Optional[Session], trade: Union[Trade, 
     return pos_map
 
 
+def get_open_trades_context(session: Session) -> List[Dict[str, Any]]:
+    """
+    Fetches all open trades formatted with minimal active open legs for Gemini context.
+    Excludes historical closed actions, cancelled/failed actions, full timestamps,
+    and extraneous metadata from prompt context to minimize LLM latency and avoid cross-contamination.
+    """
+    open_trades = session.query(Trade).filter(Trade.status == "OPEN").all()
+    
+    context = []
+    for trade in open_trades:
+        active_legs = []
+        net_positions = compute_trade_net_positions(session, trade)
+        
+        has_active_net = False
+        if net_positions:
+            for sym, pos_info in net_positions.items():
+                if pos_info.get("position_side") != "FLAT" and pos_info.get("abs_quantity", 0) > 0:
+                    has_active_net = True
+                    template_act = pos_info.get("template_action")
+                    ot = template_act.option_type if template_act else None
+                    if not ot and sym:
+                        sym_u = sym.strip().upper()
+                        if sym_u.endswith("PE"):
+                            ot = "PE"
+                        elif sym_u.endswith("CE"):
+                            ot = "CE"
+                        elif sym_u.endswith("FUT") or "FUT" in sym_u:
+                            ot = "FUT"
+
+                    side = "BUY" if pos_info.get("position_side") == "LONG" else "SELL"
+                    active_legs.append({
+                        "tradingsymbol": sym,
+                        "strike": template_act.strike if template_act else None,
+                        "option_type": ot,
+                        "transaction_type": side,
+                        "action_type": side,
+                        "is_main": getattr(template_act, "is_main", True),
+                        "is_adjustment": getattr(template_act, "is_adjustment", False) or False,
+                        "quantity": pos_info.get("abs_quantity"),
+                        "net_lots": pos_info.get("net_lots", 1)
+                    })
+
+        # Fallback if compute_trade_net_positions produced no net positions (e.g. actions without tradingsymbol or unit test fixtures)
+        if not has_active_net and trade.actions:
+            valid_entries = [
+                a for a in trade.actions
+                if a.action_type in ["BUY", "SELL"] and (a.order_status or "PENDING") not in ["FAILED", "CANCELLED"]
+            ]
+            for action in valid_entries:
+                ot = action.option_type
+                if not ot and action.tradingsymbol:
+                    sym_u = action.tradingsymbol.strip().upper()
+                    if sym_u.endswith("PE"):
+                        ot = "PE"
+                    elif sym_u.endswith("CE"):
+                        ot = "CE"
+                    elif sym_u.endswith("FUT") or "FUT" in sym_u:
+                        ot = "FUT"
+
+                active_legs.append({
+                    "tradingsymbol": action.tradingsymbol or action.instrument_name,
+                    "strike": action.strike,
+                    "option_type": ot,
+                    "transaction_type": action.transaction_type or action.action_type,
+                    "action_type": action.action_type,
+                    "is_main": action.is_main if action.is_main is not None else True,
+                    "is_adjustment": getattr(action, "is_adjustment", False) or False,
+                    "quantity": action.quantity,
+                    "lots": action.lots or 1
+                })
+
+        clean_u = clean_symbol(trade.underlying)
+        context.append({
+            "id": trade.id,
+            "status": trade.status,
+            "structure_type": trade.structure_type,
+            "underlying": clean_u,
+            "active_legs": active_legs,
+            "existing_orders": active_legs,  # alias for backward compatibility
+            "adjustment_count": trade.adjustment_count or 0,
+            "max_adjustments": trade.max_adjustments if trade.max_adjustments is not None else 1,
+            "last_adjustment_price": trade.last_adjustment_price,
+            "last_adjustment_at": trade.last_adjustment_at.isoformat() if trade.last_adjustment_at else None,
+        })
+    return context
+
+
 def ensure_square_off_actions(session: Session, trade: Trade, db_message: Message, parsed_actions: list = None) -> list:
     """
     Scans a trade's net open positions and creates reverse square-off Action records
@@ -705,68 +749,118 @@ def process_trade_actions_and_sizing(
     for idx, action_schema in enumerate(parsed_actions):
         u_symbol = clean_symbol(getattr(action_schema, "underlying", None) or (trade.underlying if trade else None))
         o_type = getattr(action_schema, "option_type", None)
+        if o_type:
+            o_type = str(o_type).strip().upper()
         strike_val = getattr(action_schema, "strike", None)
         expiry_str = getattr(action_schema, "expiry_info", None)
         is_adj_leg = bool(getattr(action_schema, "is_adjustment", False))
         action_type = getattr(action_schema, "action_type", "INFO").upper()
 
-        # Context-aware cross-referencing for exit actions
+        # Context-aware cross-referencing for exit actions or leg updates
         matched_pa = None
-        if action_type in ["EXIT", "CLOSE_LEG"] and trade and getattr(trade, "actions", None):
+        is_exit_action = action_type in ["EXIT", "CLOSE_LEG"] or (trade and trade.status == "CLOSED")
+
+        if trade and getattr(trade, "actions", None):
+            open_acts = [
+                pa for pa in trade.actions
+                if pa.action_type in ["BUY", "SELL"] and pa.order_status not in ["FAILED", "CANCELLED"]
+            ]
+
+            def _get_act_option_type(act: Action) -> Optional[str]:
+                if act.option_type:
+                    return act.option_type.strip().upper()
+                if act.tradingsymbol:
+                    sym = act.tradingsymbol.strip().upper()
+                    if sym.endswith("PE"):
+                        return "PE"
+                    elif sym.endswith("CE"):
+                        return "CE"
+                    elif sym.endswith("FUT") or "FUT" in sym:
+                        return "FUT"
+                return None
+
             is_hedge_ref = (
                 getattr(action_schema, "is_main", None) is False or
                 "hedge" in str(getattr(action_schema, "details", "")).lower() or
                 "hedge" in str(getattr(action_schema, "instrument_name", "")).lower()
             )
-            # 1. If explicit hedge exit without strike, inherit from active hedge leg
-            if is_hedge_ref and strike_val is None:
-                for pa in trade.actions:
-                    if pa.action_type in ["BUY", "SELL"] and pa.order_status not in ["FAILED", "CANCELLED"]:
-                        if not getattr(pa, "is_main", True) or (pa.transaction_type or pa.action_type).upper() == "BUY":
-                            strike_val = pa.strike
-                            o_type = pa.option_type or o_type
-                            expiry_str = pa.expiry or expiry_str
-                            u_symbol = pa.underlying or u_symbol
-                            matched_pa = pa
-                            break
-            # 2. If strike is specified, inherit from trade open leg
-            elif strike_val is not None:
-                for pa in trade.actions:
-                    if pa.action_type in ["BUY", "SELL"] and pa.order_status not in ["FAILED", "CANCELLED"]:
-                        if pa.strike and abs(pa.strike - strike_val) < 0.01:
-                            o_type = pa.option_type or o_type
-                            expiry_str = pa.expiry or expiry_str
-                            u_symbol = pa.underlying or u_symbol
-                            matched_pa = pa
-                            break
-            # 3. If strike is missing and single open leg exists, inherit from that open leg
-            elif strike_val is None and not is_hedge_ref:
-                open_acts = [
-                    pa for pa in trade.actions
-                    if pa.action_type in ["BUY", "SELL"] and pa.order_status not in ["FAILED", "CANCELLED"]
-                ]
-                if len(open_acts) == 1:
-                    strike_val = open_acts[0].strike
-                    o_type = open_acts[0].option_type or o_type
-                    expiry_str = open_acts[0].expiry or expiry_str
-                    u_symbol = open_acts[0].underlying or u_symbol
-                    matched_pa = open_acts[0]
+            is_main_ref = (
+                getattr(action_schema, "is_main", None) is True or
+                "main" in str(getattr(action_schema, "details", "")).lower() or
+                "main" in str(getattr(action_schema, "instrument_name", "")).lower()
+            )
 
-        o_type = o_type or "CE"
-        inst = resolve_nfo_instrument(u_symbol, strike_val, o_type, expiry_str)
-        if not inst and matched_pa and matched_pa.tradingsymbol:
+            # 1. Exact strike match across open trade actions
+            if strike_val is not None:
+                for pa in open_acts:
+                    if pa.strike is not None and abs(pa.strike - strike_val) < 0.01:
+                        pa_ot = _get_act_option_type(pa)
+                        o_type = o_type or pa_ot
+                        expiry_str = expiry_str or pa.expiry
+                        u_symbol = u_symbol or pa.underlying
+                        matched_pa = pa
+                        break
+
+            # 2. Explicit hedge exit without strike
+            if not matched_pa and (is_exit_action or o_type is None) and is_hedge_ref:
+                for pa in open_acts:
+                    if (not getattr(pa, "is_main", True)) or (pa.transaction_type or pa.action_type).upper() == "BUY":
+                        strike_val = strike_val if strike_val is not None else pa.strike
+                        pa_ot = _get_act_option_type(pa)
+                        o_type = o_type or pa_ot
+                        expiry_str = expiry_str or pa.expiry
+                        u_symbol = u_symbol or pa.underlying
+                        matched_pa = pa
+                        break
+
+            # 3. Explicit main exit without strike
+            if not matched_pa and (is_exit_action or o_type is None) and is_main_ref and len(open_acts) > 1:
+                for pa in open_acts:
+                    if getattr(pa, "is_main", True) or (pa.transaction_type or pa.action_type).upper() == "SELL":
+                        strike_val = strike_val if strike_val is not None else pa.strike
+                        pa_ot = _get_act_option_type(pa)
+                        o_type = o_type or pa_ot
+                        expiry_str = expiry_str or pa.expiry
+                        u_symbol = u_symbol or pa.underlying
+                        matched_pa = pa
+                        break
+
+            # 4. If single open leg exists in trade
+            if not matched_pa and (is_exit_action or o_type is None) and len(open_acts) == 1:
+                pa = open_acts[0]
+                strike_val = strike_val if strike_val is not None else pa.strike
+                pa_ot = _get_act_option_type(pa)
+                o_type = o_type or pa_ot
+                expiry_str = expiry_str or pa.expiry
+                u_symbol = u_symbol or pa.underlying
+                matched_pa = pa
+
+            # 5. Positional match if multi-leg exit count equals open legs count
+            if not matched_pa and (is_exit_action or o_type is None) and len(parsed_actions) == len(open_acts) and len(open_acts) > 1 and idx < len(open_acts):
+                pa = open_acts[idx]
+                strike_val = strike_val if strike_val is not None else pa.strike
+                pa_ot = _get_act_option_type(pa)
+                o_type = o_type or pa_ot
+                expiry_str = expiry_str or pa.expiry
+                u_symbol = u_symbol or pa.underlying
+                matched_pa = pa
+
+        # Resolve NFO Instrument - Strictly forbid arbitrary default fallbacks to 'CE'
+        inst = None
+        if matched_pa and matched_pa.tradingsymbol:
+            pa_ot = _get_act_option_type(matched_pa) or o_type
             inst = {
                 "tradingsymbol": matched_pa.tradingsymbol,
                 "instrument_token": matched_pa.instrument_token,
                 "lot_size": int(matched_pa.quantity / (matched_pa.lots or 1)) if matched_pa.quantity and matched_pa.lots else 1,
-                "expiry": matched_pa.expiry,
-                "strike": matched_pa.strike,
-                "option_type": matched_pa.option_type
+                "expiry": matched_pa.expiry or expiry_str,
+                "strike": matched_pa.strike if matched_pa.strike is not None else strike_val,
+                "option_type": pa_ot
             }
-        elif inst and matched_pa and matched_pa.tradingsymbol and not getattr(action_schema, "expiry_info", None):
-            inst["tradingsymbol"] = matched_pa.tradingsymbol
-            if matched_pa.instrument_token:
-                inst["instrument_token"] = matched_pa.instrument_token
+            if pa_ot and not o_type:
+                o_type = pa_ot
+        elif u_symbol:
+            inst = resolve_nfo_instrument(u_symbol, strike_val, o_type, expiry_str)
 
         resolved_items.append({
             "schema": action_schema,

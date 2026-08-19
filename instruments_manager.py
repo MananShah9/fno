@@ -14,6 +14,22 @@ INSTRUMENTS_FILE = os.path.join(DATA_DIR, "nfo_instruments.csv")
 
 _cached_instruments: Optional[List[Dict[str, Any]]] = None
 _cached_fetch_date: Optional[str] = None
+_cached_underlyings_list: Optional[List[str]] = None
+_cached_underlyings_set: Optional[set] = None
+
+# Known market indices for derivatives
+KNOWN_INDEX_SYMBOLS = {
+    "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50",
+    "SENSEX", "BANKEX", "NIFTYIT", "NIFTY50", "NIFTYBANK", "CNXNIFTY", "CNXIT", "CNXFINANCE"
+}
+
+# Fallback tickers list used if NFO instruments master is inaccessible
+DEFAULT_FALLBACK_TICKERS = [
+    "BANKNIFTY", "MIDCPNIFTY", "FINNIFTY", "NIFTY", "SENSEX", "BANKEX", "NIFTYNXT50",
+    "RELIANCE", "TATASTEEL", "HDFCBANK", "ICICIBANK", "SBIN", "INFY", "TCS",
+    "BAJFINANCE", "VBL", "INDIGO", "NATIONALUM", "COALINDIA", "BHEL", "MARUTI",
+    "AXISBANK", "KOTAKBANK", "LT", "ITC"
+]
 
 def get_proxy_dict():
     proxy_url = os.getenv("ZERODHA_PROXY_URL", "http://100.125.89.97:8888")
@@ -63,7 +79,7 @@ def download_and_cache_nfo_instruments() -> str:
         raise
 
 def get_nfo_instruments() -> List[Dict[str, Any]]:
-    global _cached_instruments, _cached_fetch_date
+    global _cached_instruments, _cached_fetch_date, _cached_underlyings_list, _cached_underlyings_set
     today_str = datetime.now().strftime("%Y-%m-%d")
 
     if _cached_instruments and _cached_fetch_date == today_str:
@@ -78,17 +94,65 @@ def get_nfo_instruments() -> List[Dict[str, Any]]:
 
     _cached_instruments = instruments
     _cached_fetch_date = today_str
+    _cached_underlyings_list = None
+    _cached_underlyings_set = None
     return instruments
+
+def get_known_underlyings() -> List[str]:
+    """
+    Returns a dynamically loaded list of all underlying derivative equity and index symbols
+    parsed directly from the daily NSE NFO instruments master database and known market indices.
+    The list is sorted by length in descending order (longest first) to ensure specific/longer
+    symbols match before shorter prefixes.
+    """
+    global _cached_underlyings_list, _cached_underlyings_set, _cached_fetch_date
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    if _cached_underlyings_list and _cached_fetch_date == today_str:
+        return _cached_underlyings_list
+
+    symbols_set = set(KNOWN_INDEX_SYMBOLS)
+    try:
+        instruments = get_nfo_instruments()
+        for row in instruments:
+            name = row.get("name")
+            if name:
+                clean_name = str(name).strip().upper()
+                if clean_name:
+                    symbols_set.add(clean_name)
+    except Exception as e:
+        logger.warning(f"Could not load underlyings from NFO instruments CSV: {e}. Using fallback tickers.")
+        symbols_set.update(DEFAULT_FALLBACK_TICKERS)
+
+    # Sort by length descending, then alphabetical for deterministic ordering
+    sorted_symbols = sorted(list(symbols_set), key=lambda x: (len(x), x), reverse=True)
+    _cached_underlyings_list = sorted_symbols
+    _cached_underlyings_set = symbols_set
+    return sorted_symbols
+
+def get_known_underlyings_set() -> set:
+    """
+    Returns a set of all known underlying tickers for fast O(1) membership lookup.
+    """
+    global _cached_underlyings_set, _cached_fetch_date
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    if _cached_underlyings_set and _cached_fetch_date == today_str:
+        return _cached_underlyings_set
+
+    get_known_underlyings()
+    return _cached_underlyings_set or set(DEFAULT_FALLBACK_TICKERS)
 
 def resolve_nfo_instrument(
     underlying: str,
     strike: Optional[float] = None,
-    option_type: str = "CE",
+    option_type: Optional[str] = None,
     expiry_hint: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
     """
     Looks up exact NFO instrument given underlying, strike, option_type, and optional expiry.
     Returns dict with tradingsymbol, instrument_token, lot_size, tick_size, expiry, etc.
+    Strictly forbids arbitrary default fallbacks to 'CE' for options.
     """
     if not underlying:
         return None
@@ -97,7 +161,17 @@ def resolve_nfo_instrument(
     today_str = datetime.now().strftime("%Y-%m-%d")
     
     clean_underlying = underlying.strip().upper()
-    clean_option_type = option_type.strip().upper() if option_type else "CE"
+    clean_option_type = option_type.strip().upper() if option_type else None
+
+    # If strike is specified for an option, option_type MUST be provided ('CE' or 'PE').
+    # Arbitrary defaulting to 'CE' is strictly forbidden to prevent unintended opposite-side trades.
+    if strike is not None:
+        if clean_option_type not in ["CE", "PE"]:
+            logger.warning(
+                f"Cannot resolve NFO option instrument for underlying={underlying}, strike={strike}: "
+                f"option_type '{option_type}' is missing or invalid (must be 'CE' or 'PE')."
+            )
+            return None
 
     candidates = []
     for row in instruments:
@@ -108,10 +182,10 @@ def resolve_nfo_instrument(
 
         # Match instrument_type
         row_type = row.get("instrument_type", "").strip().upper()
-        if clean_option_type == "FUT":
+        if clean_option_type == "FUT" or (clean_option_type is None and strike is None):
             if row_type != "FUT":
                 continue
-        else:
+        elif clean_option_type in ["CE", "PE"]:
             if row_type != clean_option_type:
                 continue
 
@@ -123,6 +197,8 @@ def resolve_nfo_instrument(
                         continue
                 except (ValueError, TypeError):
                     continue
+        else:
+            continue
 
         # Filter out expired instruments
         row_expiry = row.get("expiry", "")
@@ -198,12 +274,6 @@ def parse_price_value(price_val: Any) -> Optional[float]:
         return (float(nums[0]) + float(nums[1])) / 2.0
     except (ValueError, TypeError):
         return None
-
-# Known market indices for derivatives
-KNOWN_INDEX_SYMBOLS = {
-    "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50",
-    "SENSEX", "BANKEX", "NIFTYIT", "NIFTY50", "NIFTYBANK", "CNXNIFTY", "CNXIT", "CNXFINANCE"
-}
 
 # Zerodha Kite Connect spot instrument quote key mappings for indices
 INDEX_SPOT_KEY_MAP = {
@@ -292,9 +362,10 @@ def classify_strategy_type(
     for leg in entry_legs:
         # Check action_type from schema or dict
         at = getattr(leg.get("schema", None), "action_type", None) or leg.get("action_type") or "INFO"
-        ot = getattr(leg.get("schema", None), "option_type", None) or leg.get("option_type") or "CE"
+        ot = getattr(leg.get("schema", None), "option_type", None) or leg.get("option_type")
         action_types.append(str(at).upper())
-        option_types.append(str(ot).upper())
+        if ot:
+            option_types.append(str(ot).upper())
 
     has_fut = any(ot == "FUT" for ot in option_types)
     has_sell = any(at == "SELL" for at in action_types)
