@@ -42,6 +42,27 @@ def format_status_badge(status: str) -> str:
         return "⏳ IN_PROGRESS"
     return f"ℹ️ {status_clean}"
 
+def format_order_status_badge(order_status: str, filled_qty: int = 0, total_qty: int = 0) -> str:
+    st = str(order_status or "PENDING").upper()
+    if st in ["FILLED", "EXECUTED"]:
+        return "✅ FILLED"
+    elif st == "OPEN_LIMIT":
+        return "⏳ OPEN_LIMIT"
+    elif st == "TRIGGER_PENDING":
+        return "⏳ TRIGGER_PENDING"
+    elif st == "PARTIAL_FILL":
+        fill_info = f" ({filled_qty}/{total_qty})" if total_qty else ""
+        return f"🔄 PARTIAL{fill_info}"
+    elif st in ["SUBMITTED", "PLACED"]:
+        return "🚀 SUBMITTED"
+    elif st == "REJECTED":
+        return "❌ REJECTED"
+    elif st == "CANCELLED":
+        return "🚫 CANCELLED"
+    elif st == "FAILED":
+        return "❌ FAILED"
+    return f"⏳ {st}"
+
 def display_message_stage_timeline(message_id: int, is_tg_id: bool = False, interactive: bool = True):
     """Renders a detailed diagnostic breakdown for a message's lifecycle across all stages."""
     session = db.SessionLocal()
@@ -410,7 +431,7 @@ def view_trade_details(trade_id: int, session: Session):
                 act.price or "N/A",
                 sl_str,
                 act.target or "N/A",
-                act.order_status or "PENDING",
+                format_order_status_badge(act.order_status, getattr(act, "filled_quantity", 0) or 0, act.quantity or 0),
                 "✅ Yes" if act.telegram_sent else "❌ No"
             ])
         print(tabulate(actions_data, headers=["ID", "Type", "Role", "Instrument", "Qty (Lots)", "Price", "SL", "Target", "Status", "Tg Sent?"], tablefmt="grid"))
@@ -449,7 +470,7 @@ def view_all_actions():
                     act.price or "N/A",
                     sl_str,
                     act.target or "N/A",
-                    act.order_status or "PENDING",
+                    format_order_status_badge(act.order_status, getattr(act, "filled_quantity", 0) or 0, act.quantity or 0),
                     "✅ Yes" if act.telegram_sent else "❌ No"
                 ])
             print(tabulate(table_data, headers=["ID", "Trade Ref", "Type", "Role", "Instrument", "Qty (Lots)", "Price", "SL", "Target", "Status", "Sent to Tg?"], tablefmt="grid"))

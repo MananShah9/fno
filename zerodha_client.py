@@ -413,6 +413,50 @@ def verify_zerodha_positions_zero(tradingsymbols: list) -> dict:
     }
 
 
+def map_zerodha_status_to_action_status(
+    raw_status: Optional[str],
+    filled_qty: int = 0,
+    total_qty: int = 0,
+    order_type: Optional[str] = None
+) -> str:
+    """
+    Maps Zerodha Kite Connect order execution status to normalized internal Action order states:
+      - 'COMPLETE' -> 'FILLED'
+      - 'OPEN' -> 'OPEN_LIMIT'
+      - 'TRIGGER PENDING' -> 'TRIGGER_PENDING'
+      - 'REJECTED' -> 'REJECTED'
+      - 'CANCELLED' -> 'CANCELLED'
+      - 'AMO REQ RECEIVED', 'PUT ORDER REQ RECEIVED', 'MODIFY PENDING', 'VALIDATION PENDING' -> 'SUBMITTED'
+      - If 0 < filled_qty < total_qty and not rejected/cancelled/complete -> 'PARTIAL_FILL'
+    """
+    if not raw_status:
+        return "SUBMITTED"
+    s = str(raw_status).strip().upper()
+
+    if s == "COMPLETE":
+        return "FILLED"
+    if s == "REJECTED":
+        return "REJECTED"
+    if s == "CANCELLED":
+        return "CANCELLED"
+
+    # Check for partial fill before open/trigger pending
+    if total_qty and 0 < filled_qty < total_qty:
+        return "PARTIAL_FILL"
+
+    if s == "TRIGGER PENDING":
+        return "TRIGGER_PENDING"
+
+    if s == "OPEN":
+        return "OPEN_LIMIT"
+    if s in ["AMO REQ RECEIVED", "PUT ORDER REQ RECEIVED", "MODIFY PENDING", "VALIDATION PENDING"]:
+        return "SUBMITTED"
+    if s in ["PLACED", "SUBMITTED", "PENDING", "FAILED", "FILLED", "EXECUTED", "OPEN_LIMIT", "TRIGGER_PENDING", "PARTIAL_FILL"]:
+        return s
+
+    return "OPEN_LIMIT" if (order_type and str(order_type).upper() == "LIMIT") else "SUBMITTED"
+
+
 def get_zerodha_order_status(order_id: str) -> dict:
     """
     Fetches the latest execution status for an order_id from Zerodha Kite Connect.
@@ -420,7 +464,8 @@ def get_zerodha_order_status(order_id: str) -> dict:
         {
             "success": bool,
             "confirmed": bool,
-            "status": str,
+            "status": str,            # Normalized Action status ('FILLED', 'OPEN_LIMIT', 'TRIGGER_PENDING', 'SUBMITTED', 'REJECTED', 'CANCELLED', 'PARTIAL_FILL')
+            "raw_status": str,        # Raw broker status ('COMPLETE', 'OPEN', 'REJECTED', etc.)
             "status_message": str,
             "filled_quantity": int,
             "pending_quantity": int,
@@ -432,6 +477,7 @@ def get_zerodha_order_status(order_id: str) -> dict:
             "success": False,
             "confirmed": False,
             "status": "UNKNOWN",
+            "raw_status": "UNKNOWN",
             "status_message": "Missing order_id",
             "filled_quantity": 0,
             "pending_quantity": 0,
@@ -455,19 +501,28 @@ def get_zerodha_order_status(order_id: str) -> dict:
                 history = kite.order_history(clean_order_id)
                 if history and isinstance(history, list):
                     latest = history[-1]
-                    status = str(latest.get("status", "")).strip().upper()
+                    raw_status = str(latest.get("status", "")).strip().upper()
                     status_msg = latest.get("status_message") or ""
                     filled_qty = int(latest.get("filled_quantity", 0) or 0)
                     pending_qty = int(latest.get("pending_quantity", 0) or 0)
+                    total_qty = int(latest.get("quantity", 0) or (filled_qty + pending_qty))
                     avg_price = float(latest.get("average_price", 0.0) or 0.0)
+                    ord_type = latest.get("order_type")
 
-                    is_confirmed = status in confirmed_statuses
-                    is_failed = status in failed_statuses
+                    is_confirmed = raw_status in confirmed_statuses
+                    is_failed = raw_status in failed_statuses
+                    mapped_status = map_zerodha_status_to_action_status(
+                        raw_status=raw_status,
+                        filled_qty=filled_qty,
+                        total_qty=total_qty,
+                        order_type=ord_type
+                    )
 
                     return {
                         "success": not is_failed,
                         "confirmed": is_confirmed,
-                        "status": status,
+                        "status": mapped_status,
+                        "raw_status": raw_status,
                         "status_message": status_msg,
                         "filled_quantity": filled_qty,
                         "pending_quantity": pending_qty,
@@ -482,19 +537,28 @@ def get_zerodha_order_status(order_id: str) -> dict:
                 orders = kite.orders() or []
                 for o in orders:
                     if str(o.get("order_id", "")).strip() == clean_order_id:
-                        status = str(o.get("status", "")).strip().upper()
+                        raw_status = str(o.get("status", "")).strip().upper()
                         status_msg = o.get("status_message") or ""
                         filled_qty = int(o.get("filled_quantity", 0) or 0)
                         pending_qty = int(o.get("pending_quantity", 0) or 0)
+                        total_qty = int(o.get("quantity", 0) or (filled_qty + pending_qty))
                         avg_price = float(o.get("average_price", 0.0) or 0.0)
+                        ord_type = o.get("order_type")
 
-                        is_confirmed = status in confirmed_statuses
-                        is_failed = status in failed_statuses
+                        is_confirmed = raw_status in confirmed_statuses
+                        is_failed = raw_status in failed_statuses
+                        mapped_status = map_zerodha_status_to_action_status(
+                            raw_status=raw_status,
+                            filled_qty=filled_qty,
+                            total_qty=total_qty,
+                            order_type=ord_type
+                        )
 
                         return {
                             "success": not is_failed,
                             "confirmed": is_confirmed,
-                            "status": status,
+                            "status": mapped_status,
+                            "raw_status": raw_status,
                             "status_message": status_msg,
                             "filled_quantity": filled_qty,
                             "pending_quantity": pending_qty,
@@ -503,11 +567,12 @@ def get_zerodha_order_status(order_id: str) -> dict:
             except Exception as oe:
                 logger.debug(f"orders() lookup failed for {clean_order_id}: {oe}")
 
-        # If order status API is not available or returned nothing, treat placed order as confirmed
+        # If order status API is not available or returned nothing, treat placed order as confirmed OPEN_LIMIT
         return {
             "success": True,
             "confirmed": True,
-            "status": "OPEN",
+            "status": "OPEN_LIMIT",
+            "raw_status": "OPEN",
             "status_message": "Order status OPEN (assumed)",
             "filled_quantity": 0,
             "pending_quantity": 0,
@@ -519,7 +584,8 @@ def get_zerodha_order_status(order_id: str) -> dict:
         return {
             "success": True,
             "confirmed": True,
-            "status": "OPEN",
+            "status": "OPEN_LIMIT",
+            "raw_status": "OPEN",
             "status_message": str(e),
             "filled_quantity": 0,
             "pending_quantity": 0,
@@ -534,20 +600,21 @@ def verify_zerodha_order_confirmation(
 ) -> dict:
     """
     Polls Zerodha order status to verify confirmation / acceptance on the exchange.
-    Returns status dict with confirmed: bool, status: str, status_message: str.
+    Returns status dict with confirmed: bool, status: str, raw_status: str, status_message: str.
     """
     last_status = None
     for attempt in range(max_retries):
         status_info = get_zerodha_order_status(order_id)
         last_status = status_info
         status = status_info.get("status", "").upper()
+        raw_status = status_info.get("raw_status", "").upper()
 
-        if status in ["REJECTED", "CANCELLED"]:
+        if status in ["REJECTED", "CANCELLED"] or raw_status in ["REJECTED", "CANCELLED"]:
             logger.warning(f"Order {order_id} was {status} by Zerodha/Exchange: {status_info.get('status_message')}")
             return status_info
 
         if status_info.get("confirmed"):
-            logger.info(f"Order {order_id} confirmed on Zerodha: status={status}")
+            logger.info(f"Order {order_id} confirmed on Zerodha: status={status} (raw={raw_status})")
             return status_info
 
         if attempt < max_retries - 1 and retry_delay > 0:
@@ -556,12 +623,129 @@ def verify_zerodha_order_confirmation(
     return last_status or {
         "success": True,
         "confirmed": True,
-        "status": "OPEN",
+        "status": "OPEN_LIMIT",
+        "raw_status": "OPEN",
         "status_message": "Confirmed after retries",
         "filled_quantity": 0,
         "pending_quantity": 0,
         "average_price": 0.0
     }
+
+
+def cancel_zerodha_order(order_id: str, variety: str = "regular") -> dict:
+    """
+    Cancels an open or trigger order on Zerodha Kite API.
+    variety: 'regular' or 'amo'.
+    Returns dict: {"success": bool, "order_id": str, "message": str}
+    """
+    if not order_id:
+        return {"success": False, "order_id": None, "message": "Missing order_id"}
+    try:
+        kite = get_zerodha_client()
+        clean_order_id = str(order_id).strip()
+        v = kite.VARIETY_REGULAR if str(variety).lower() == "regular" else kite.VARIETY_AMO
+        resp = kite.cancel_order(variety=v, order_id=clean_order_id)
+        logger.info(f"Cancelled Zerodha order {clean_order_id}: {resp}")
+        return {
+            "success": True,
+            "order_id": clean_order_id,
+            "message": f"Order {clean_order_id} cancelled successfully."
+        }
+    except Exception as e:
+        logger.warning(f"Error cancelling Zerodha order {order_id}: {e}")
+        return {
+            "success": False,
+            "order_id": str(order_id),
+            "message": str(e)
+        }
+
+
+def reconcile_zerodha_orders(order_ids: Optional[List[str]] = None) -> Dict[str, dict]:
+    """
+    Fetches the latest execution status for a list of order IDs from Zerodha Kite Connect.
+    Queries bulk kite.orders() for efficiency (1 API call).
+    Returns dict mapping order_id -> {
+        "order_id": str,
+        "status": mapped_status,
+        "raw_status": str,
+        "filled_quantity": int,
+        "pending_quantity": int,
+        "average_price": float,
+        "status_message": str,
+        "tradingsymbol": str,
+        "transaction_type": str
+    }
+    """
+    results = {}
+    target_ids = {str(oid).strip() for oid in order_ids} if order_ids else None
+
+    try:
+        kite = get_zerodha_client()
+        orders_list = []
+        if hasattr(kite, "orders"):
+            try:
+                orders_list = kite.orders() or []
+            except Exception as oe:
+                logger.warning(f"kite.orders() bulk call failed during reconciliation: {oe}")
+
+        for o in orders_list:
+            oid = str(o.get("order_id", "")).strip()
+            if not oid:
+                continue
+            if target_ids is not None and oid not in target_ids:
+                continue
+
+            raw_status = str(o.get("status", "")).strip().upper()
+            status_msg = o.get("status_message") or ""
+            filled_qty = int(o.get("filled_quantity", 0) or 0)
+            pending_qty = int(o.get("pending_quantity", 0) or 0)
+            total_qty = int(o.get("quantity", 0) or (filled_qty + pending_qty))
+            avg_price = float(o.get("average_price", 0.0) or 0.0)
+            ord_type = o.get("order_type")
+
+            mapped_status = map_zerodha_status_to_action_status(
+                raw_status=raw_status,
+                filled_qty=filled_qty,
+                total_qty=total_qty,
+                order_type=ord_type
+            )
+
+            results[oid] = {
+                "order_id": oid,
+                "status": mapped_status,
+                "raw_status": raw_status,
+                "filled_quantity": filled_qty,
+                "pending_quantity": pending_qty,
+                "total_quantity": total_qty,
+                "average_price": avg_price,
+                "status_message": status_msg,
+                "tradingsymbol": o.get("tradingsymbol"),
+                "transaction_type": o.get("transaction_type")
+            }
+
+        # Fallback for any requested order_id not returned in bulk kite.orders()
+        if target_ids:
+            missing_ids = target_ids - set(results.keys())
+            for m_id in missing_ids:
+                st = get_zerodha_order_status(m_id)
+                if st and st.get("status") != "UNKNOWN":
+                    results[m_id] = {
+                        "order_id": m_id,
+                        "status": st.get("status"),
+                        "raw_status": st.get("raw_status", st.get("status")),
+                        "filled_quantity": st.get("filled_quantity", 0),
+                        "pending_quantity": st.get("pending_quantity", 0),
+                        "total_quantity": st.get("filled_quantity", 0) + st.get("pending_quantity", 0),
+                        "average_price": st.get("average_price", 0.0),
+                        "status_message": st.get("status_message", ""),
+                        "tradingsymbol": None,
+                        "transaction_type": None
+                    }
+
+    except Exception as e:
+        logger.warning(f"Error during bulk Zerodha order reconciliation: {e}")
+
+    return results
 
 
 def place_zerodha_order(
@@ -671,40 +855,61 @@ def place_zerodha_order(
 
         logger.info(f"Order submitted to Zerodha. Order ID: {order_id}")
 
-        status_name = "OPEN"
+        status_name = "OPEN_LIMIT" if ot == kite.ORDER_TYPE_LIMIT else "SUBMITTED"
+        raw_status = "OPEN" if ot == kite.ORDER_TYPE_LIMIT else "SUBMITTED"
         status_msg = None
+        filled_qty = 0
+        pending_qty = int(quantity)
+        avg_price = 0.0
 
         if verify_confirmation and order_id:
             ver_info = verify_zerodha_order_confirmation(str(order_id))
-            if ver_info.get("status") == "REJECTED":
-                rej_reason = ver_info.get("status_message") or "Rejected by Zerodha RMS"
+            raw_status = ver_info.get("raw_status") or ver_info.get("status", "OPEN")
+            status_name = ver_info.get("status", "OPEN_LIMIT")
+            status_msg = ver_info.get("status_message")
+            filled_qty = int(ver_info.get("filled_quantity", 0) or 0)
+            pending_qty = int(ver_info.get("pending_quantity", int(quantity) - filled_qty) or 0)
+            avg_price = float(ver_info.get("average_price", 0.0) or 0.0)
+
+            if status_name == "REJECTED" or raw_status == "REJECTED":
+                rej_reason = status_msg or "Rejected by Zerodha RMS"
                 logger.error(f"Zerodha RMS rejected order {order_id}: {rej_reason}")
                 return {
                     "success": False,
                     "order_id": str(order_id),
                     "status": "REJECTED",
+                    "raw_status": raw_status,
                     "message": f"Order {order_id} rejected by Zerodha RMS: {rej_reason}",
-                    "status_message": rej_reason
+                    "status_message": rej_reason,
+                    "filled_quantity": filled_qty,
+                    "pending_quantity": pending_qty,
+                    "average_price": avg_price
                 }
-            elif ver_info.get("status") == "CANCELLED":
-                can_reason = ver_info.get("status_message") or "Order cancelled"
+            elif status_name == "CANCELLED" or raw_status == "CANCELLED":
+                can_reason = status_msg or "Order cancelled"
                 logger.error(f"Order {order_id} was cancelled: {can_reason}")
                 return {
                     "success": False,
                     "order_id": str(order_id),
                     "status": "CANCELLED",
+                    "raw_status": raw_status,
                     "message": f"Order {order_id} cancelled: {can_reason}",
-                    "status_message": can_reason
+                    "status_message": can_reason,
+                    "filled_quantity": filled_qty,
+                    "pending_quantity": pending_qty,
+                    "average_price": avg_price
                 }
-            status_name = ver_info.get("status", "OPEN")
-            status_msg = ver_info.get("status_message")
 
         return {
             "success": True,
             "order_id": str(order_id),
             "status": status_name,
-            "message": f"Order placed successfully. Order ID: {order_id}" + (f" ({status_name})" if status_name != "OPEN" else ""),
-            "status_message": status_msg
+            "raw_status": raw_status,
+            "message": f"Order placed successfully. Order ID: {order_id}" + (f" ({status_name})" if status_name not in ["SUBMITTED", "OPEN"] else ""),
+            "status_message": status_msg,
+            "filled_quantity": filled_qty,
+            "pending_quantity": pending_qty,
+            "average_price": avg_price
         }
 
     except Exception as e:
@@ -713,8 +918,12 @@ def place_zerodha_order(
             "success": False,
             "order_id": None,
             "status": "FAILED",
+            "raw_status": "FAILED",
             "message": str(e),
-            "status_message": str(e)
+            "status_message": str(e),
+            "filled_quantity": 0,
+            "pending_quantity": 0,
+            "average_price": 0.0
         }
 
 

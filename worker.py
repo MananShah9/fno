@@ -26,7 +26,9 @@ from zerodha_client import (
     place_zerodha_order, check_existing_zerodha_order_or_position, get_nfo_ltp,
     get_spot_ltp, get_multiple_ltp, calculate_basket_margin,
     verify_zerodha_order_confirmation, get_zerodha_order_status,
-    get_zerodha_net_positions, verify_zerodha_positions_zero
+    get_zerodha_net_positions, verify_zerodha_positions_zero,
+    map_zerodha_status_to_action_status, reconcile_zerodha_orders,
+    cancel_zerodha_order
 )
 from stage_tracker import record_stage, StageContext, get_code_location
 from time_filter import is_telegram_time_active, get_schedule_description
@@ -433,12 +435,19 @@ def format_action_telegram_message_html(trade: Trade, actions: list) -> str:
             action_line += f"({', '.join(detail_parts)})"
 
         if action.order_status and action.order_status != "PENDING":
-            status_icon = "✅" if action.order_status in ["PLACED", "EXECUTED"] else "❌"
+            status_icon = "✅" if action.order_status in ["PLACED", "EXECUTED", "FILLED"] else ("⏳" if action.order_status in ["OPEN_LIMIT", "SUBMITTED", "TRIGGER_PENDING", "PARTIAL_FILL"] else "❌")
             action_line += f"\n  Status: {status_icon} <b>{action.order_status}</b>"
+            if action.filled_quantity and action.filled_quantity > 0:
+                fill_str = f" (Filled: {action.filled_quantity}/{action.quantity or action.filled_quantity}"
+                if action.average_price and action.average_price > 0:
+                    fill_str += f" @ {action.average_price:,.2f}"
+                fill_str += ")"
+                action_line += fill_str
             if action.zerodha_order_id:
                 action_line += f" (Order ID: <code>{action.zerodha_order_id}</code>)"
-            if action.order_status == "FAILED" and action.zerodha_response:
-                action_line += f"\n  ⚠️ <i>Error: {action.zerodha_response}</i>"
+            if action.order_status in ["FAILED", "REJECTED", "CANCELLED"] and (action.rejection_reason or action.zerodha_response):
+                reason_txt = action.rejection_reason or action.zerodha_response
+                action_line += f"\n  ⚠️ <i>Error: {reason_txt}</i>"
 
         if action.details:
             action_line += f"\n  <i>Note: {action.details}</i>"
@@ -452,9 +461,9 @@ def format_action_telegram_message_html(trade: Trade, actions: list) -> str:
 
 def compute_trade_net_positions(session: Optional[Session], trade: Union[Trade, int]) -> Dict[str, Dict[str, Any]]:
     """
-    Computes the net active position balance directly by aggregating all filled/placed entry quantities
-    minus all filled/placed exit quantities for every instrument token / tradingsymbol within the trade.
-    Filters out FAILED or CANCELLED actions.
+    Computes the net active position balance directly by aggregating all filled entry quantities
+    minus all filled exit quantities for every instrument token / tradingsymbol within the trade.
+    Filters out FAILED, CANCELLED, REJECTED, and unfilled OPEN_LIMIT / SUBMITTED / TRIGGER_PENDING orders.
 
     Returns:
         dict: {
@@ -478,13 +487,13 @@ def compute_trade_net_positions(session: Optional[Session], trade: Union[Trade, 
     if session and trade_id:
         all_actions = session.query(Action).filter(
             Action.trade_id == trade_id,
-            Action.order_status.notin_(["FAILED", "CANCELLED"]),
+            Action.order_status.notin_(["FAILED", "CANCELLED", "REJECTED"]),
             Action.tradingsymbol != None
         ).order_by(Action.id.asc()).all()
     elif isinstance(trade, Trade) and getattr(trade, "actions", None):
         all_actions = [
             a for a in trade.actions
-            if a.order_status not in ["FAILED", "CANCELLED"] and a.tradingsymbol
+            if (a.order_status or "PENDING") not in ["FAILED", "CANCELLED", "REJECTED"] and a.tradingsymbol
         ]
 
     pos_map = {}
@@ -506,18 +515,33 @@ def compute_trade_net_positions(session: Optional[Session], trade: Union[Trade, 
                 "total_exit_qty": 0,
             }
 
-        qty = act.quantity or 0
         tt = (act.transaction_type or act.action_type or "").upper()
         is_entry = act.action_type in ["BUY", "SELL"]
         is_exit = act.action_type in ["EXIT", "CLOSE_LEG"]
 
         if is_entry:
+            # Calculate actual filled entry quantity
+            status = str(act.order_status or "PENDING").upper()
+            if status in ["FILLED", "EXECUTED"]:
+                qty = act.filled_quantity if (act.filled_quantity is not None and act.filled_quantity > 0) else (act.quantity or 0)
+            elif status in ["PARTIAL_FILL", "PARTIALLY_FILLED"]:
+                qty = act.filled_quantity or 0
+            elif status == "PLACED":
+                # Backward compatibility with test fixtures / mocks
+                qty = act.filled_quantity if (act.filled_quantity is not None and act.filled_quantity > 0) else (act.quantity or 0)
+            elif status in ["OPEN_LIMIT", "SUBMITTED", "TRIGGER_PENDING", "PENDING"]:
+                qty = act.filled_quantity or 0
+            else:
+                qty = 0
+
             pos_map[sym]["total_entry_qty"] += qty
             if tt == "BUY":
                 pos_map[sym]["net_quantity"] += qty
             elif tt == "SELL":
                 pos_map[sym]["net_quantity"] -= qty
         elif is_exit:
+            # For exit actions, count the exit quantity intended to close or already closed
+            qty = act.quantity or 0
             pos_map[sym]["total_exit_qty"] += qty
             if tt == "BUY":
                 pos_map[sym]["net_quantity"] += qty
@@ -544,6 +568,257 @@ def compute_trade_net_positions(session: Optional[Session], trade: Union[Trade, 
             info["required_exit_side"] = None
 
     return pos_map
+
+
+def reconcile_active_orders(session: Session, trade_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    """
+    Active Order Reconciliation Mechanism:
+    Polls Zerodha Kite Connect order book to synchronize database Action states with real broker executions.
+    Distinguishes between SUBMITTED, OPEN_LIMIT, TRIGGER_PENDING, PARTIAL_FILL, FILLED, REJECTED, and CANCELLED.
+    Updates filled_quantity, pending_quantity, average_price, last_reconciled_at, and rejection_reason.
+    """
+    query = session.query(Action).filter(
+        Action.zerodha_order_id.isnot(None),
+        Action.order_status.in_(["SUBMITTED", "OPEN_LIMIT", "TRIGGER_PENDING", "PARTIAL_FILL", "PLACED", "PENDING"])
+    )
+    if trade_id:
+        query = query.filter(Action.trade_id == trade_id)
+
+    active_actions = query.all()
+    if not active_actions:
+        return []
+
+    order_ids = [a.zerodha_order_id for a in active_actions if a.zerodha_order_id]
+    broker_orders = reconcile_zerodha_orders(order_ids)
+    if not broker_orders:
+        return []
+
+    reconciled_results = []
+    trades_to_evaluate = set()
+
+    for action in active_actions:
+        oid = str(action.zerodha_order_id).strip()
+        ord_info = broker_orders.get(oid)
+        if not ord_info:
+            continue
+
+        old_status = action.order_status
+        new_status = ord_info.get("status") or old_status
+        filled_qty = int(ord_info.get("filled_quantity", action.filled_quantity or 0) or 0)
+        pending_qty = int(ord_info.get("pending_quantity", action.pending_quantity or 0) or 0)
+        avg_price = float(ord_info.get("average_price", action.average_price or 0.0) or 0.0)
+        status_msg = ord_info.get("status_message") or ""
+
+        # Update action state
+        action.order_status = new_status
+        action.filled_quantity = filled_qty
+        action.pending_quantity = pending_qty
+        if avg_price > 0:
+            action.average_price = avg_price
+        action.last_reconciled_at = datetime.utcnow()
+
+        if new_status in ["REJECTED", "CANCELLED", "FAILED"] and status_msg:
+            action.rejection_reason = status_msg
+
+        status_changed = (old_status != new_status) or ((action.filled_quantity or 0) != filled_qty)
+
+        if status_changed:
+            logger.info(
+                f"[ORDER RECONCILED] Action #{action.id} ({action.tradingsymbol}): "
+                f"{old_status} -> {new_status} (Filled: {filled_qty}, Open: {pending_qty}, AvgPrice: {avg_price})"
+            )
+            record_stage(
+                stage="ORDER_RECONCILED",
+                status="SUCCESS" if new_status in ["FILLED", "OPEN_LIMIT", "SUBMITTED"] else ("WARNING" if new_status in ["REJECTED", "CANCELLED"] else "INFO"),
+                message_id=action.message_id,
+                trade_id=action.trade_id,
+                details={
+                    "action_id": action.id,
+                    "trade_id": action.trade_id,
+                    "order_id": oid,
+                    "tradingsymbol": action.tradingsymbol,
+                    "old_status": old_status,
+                    "new_status": new_status,
+                    "filled_quantity": filled_qty,
+                    "pending_quantity": pending_qty,
+                    "average_price": avg_price,
+                    "status_message": status_msg
+                },
+                session=session
+            )
+
+        if action.trade_id:
+            trades_to_evaluate.add(action.trade_id)
+
+        reconciled_results.append({
+            "action_id": action.id,
+            "trade_id": action.trade_id,
+            "order_id": oid,
+            "tradingsymbol": action.tradingsymbol,
+            "old_status": old_status,
+            "new_status": new_status,
+            "filled_quantity": filled_qty,
+            "pending_quantity": pending_qty,
+            "average_price": avg_price,
+            "status_message": status_msg,
+            "status_changed": status_changed
+        })
+
+    # For open trades whose entry legs are all filled, log stage trace
+    for t_id in trades_to_evaluate:
+        trade_obj = session.query(Trade).filter(Trade.id == t_id, Trade.status == "OPEN").first()
+        if trade_obj and trade_obj.actions:
+            entry_acts = [a for a in trade_obj.actions if a.action_type in ["BUY", "SELL"]]
+            if entry_acts and all(a.order_status in ["FILLED", "EXECUTED", "PLACED"] for a in entry_acts):
+                record_stage(
+                    stage="TRADE_LEGS_FILLED",
+                    status="SUCCESS",
+                    trade_id=t_id,
+                    details={
+                        "trade_id": t_id,
+                        "filled_legs_count": len(entry_acts),
+                        "legs": [f"{a.tradingsymbol}: {a.filled_quantity or a.quantity} @ {a.average_price or 0.0}" for a in entry_acts]
+                    },
+                    session=session
+                )
+
+    session.commit()
+    return reconciled_results
+
+
+def cancel_unfilled_entry_orders(session: Session, trade: Trade) -> List[dict]:
+    """
+    Cancels any active unfilled entry limit/trigger orders when a trade is exiting or closing
+    to prevent lingering orders in Zerodha exchange book from executing post-closure.
+    """
+    if not trade:
+        return []
+
+    unfilled_entries = session.query(Action).filter(
+        Action.trade_id == trade.id,
+        Action.action_type.in_(["BUY", "SELL"]),
+        Action.order_status.in_(["OPEN_LIMIT", "TRIGGER_PENDING", "SUBMITTED", "PENDING"]),
+        Action.zerodha_order_id.isnot(None)
+    ).all()
+
+    cancel_results = []
+    for act in unfilled_entries:
+        oid = act.zerodha_order_id
+        c_res = cancel_zerodha_order(oid)
+        act.order_status = "CANCELLED"
+        act.rejection_reason = f"Cancelled on trade exit/close: limit order remained unfilled. {c_res.get('message', '')}"
+        act.last_reconciled_at = datetime.utcnow()
+
+        logger.info(f"Cancelled unfilled entry limit order {oid} ({act.tradingsymbol}) for Trade #{trade.id}.")
+        record_stage(
+            stage="ORDER_CANCELLED_ON_EXIT",
+            status="INFO",
+            message_id=act.message_id,
+            trade_id=trade.id,
+            details={
+                "action_id": act.id,
+                "trade_id": trade.id,
+                "order_id": oid,
+                "tradingsymbol": act.tradingsymbol,
+                "reason": "Cancelled on trade exit to prevent orphan fill",
+                "broker_response": c_res
+            },
+            session=session
+        )
+        cancel_results.append({
+            "action_id": act.id,
+            "order_id": oid,
+            "tradingsymbol": act.tradingsymbol,
+            "success": c_res.get("success", False),
+            "message": c_res.get("message")
+        })
+
+    session.commit()
+    return cancel_results
+
+
+def process_zerodha_postback(payload: dict, session: Session) -> dict:
+    """
+    Processes Zerodha Kite Connect Postback webhook events in real-time.
+    Updates the corresponding Action order state, quantities, and fill prices.
+    """
+    if not payload:
+        return {"success": False, "message": "Empty postback payload"}
+
+    order_id = str(payload.get("order_id") or "").strip()
+    if not order_id:
+        return {"success": False, "message": "Missing order_id in postback"}
+
+    action = session.query(Action).filter(Action.zerodha_order_id == order_id).first()
+    if not action:
+        logger.warning(f"Zerodha postback received for unknown order_id: {order_id}")
+        return {"success": False, "message": f"Order {order_id} not found in database"}
+
+    old_status = action.order_status
+    raw_status = str(payload.get("status", "")).strip().upper()
+    filled_qty = int(payload.get("filled_quantity", 0) or 0)
+    total_qty = int(payload.get("quantity", action.quantity or 0) or 0)
+    pending_qty = int(payload.get("pending_quantity", total_qty - filled_qty) or 0)
+    avg_price = float(payload.get("average_price", 0.0) or 0.0)
+    status_msg = str(payload.get("status_message", "") or "")
+    order_type = payload.get("order_type") or action.order_type
+
+    new_status = map_zerodha_status_to_action_status(
+        raw_status=raw_status,
+        filled_qty=filled_qty,
+        total_qty=total_qty,
+        order_type=order_type
+    )
+
+    action.order_status = new_status
+    action.filled_quantity = filled_qty
+    action.pending_quantity = pending_qty
+    if avg_price > 0:
+        action.average_price = avg_price
+    action.last_reconciled_at = datetime.utcnow()
+
+    if new_status in ["REJECTED", "CANCELLED", "FAILED"] and status_msg:
+        action.rejection_reason = status_msg
+
+    session.commit()
+
+    logger.info(
+        f"[POSTBACK PROCESSED] Action #{action.id} (Order {order_id}): "
+        f"{old_status} -> {new_status} (Filled: {filled_qty}/{total_qty}, AvgPrice: {avg_price})"
+    )
+
+    record_stage(
+        stage="ORDER_POSTBACK_RECEIVED",
+        status="SUCCESS" if new_status in ["FILLED", "OPEN_LIMIT", "SUBMITTED"] else ("WARNING" if new_status in ["REJECTED", "CANCELLED"] else "INFO"),
+        message_id=action.message_id,
+        trade_id=action.trade_id,
+        details={
+            "action_id": action.id,
+            "trade_id": action.trade_id,
+            "order_id": order_id,
+            "tradingsymbol": action.tradingsymbol,
+            "old_status": old_status,
+            "new_status": new_status,
+            "raw_status": raw_status,
+            "filled_quantity": filled_qty,
+            "pending_quantity": pending_qty,
+            "average_price": avg_price,
+            "status_message": status_msg
+        },
+        session=session
+    )
+
+    return {
+        "success": True,
+        "action_id": action.id,
+        "trade_id": action.trade_id,
+        "order_id": order_id,
+        "status": new_status,
+        "raw_status": raw_status,
+        "filled_quantity": filled_qty,
+        "pending_quantity": pending_qty,
+        "average_price": avg_price
+    }
 
 
 def get_open_trades_context(session: Session) -> List[Dict[str, Any]]:
@@ -638,7 +913,17 @@ def ensure_square_off_actions(session: Session, trade: Trade, db_message: Messag
     Scans a trade's net open positions and creates reverse square-off Action records
     if the trade is being closed or exited, computing net active quantities
     to ensure 100% of initial and averaged lots are completely closed without leaving orphaned legs.
+    Reconciles open orders with Zerodha and cancels any unfilled limit entry orders to prevent reverse exposure.
     """
+    # 1. Reconcile active orders with Zerodha
+    if session and trade and trade.id:
+        reconcile_active_orders(session, trade_id=trade.id)
+
+    # 2. Cancel any unfilled limit/trigger entry orders
+    if session and trade:
+        cancel_unfilled_entry_orders(session, trade=trade)
+
+    # 3. Compute net position based on filled quantities
     net_positions = compute_trade_net_positions(session, trade)
     if not net_positions:
         return []
@@ -648,7 +933,7 @@ def ensure_square_off_actions(session: Session, trade: Trade, db_message: Messag
 
     for sym, pos_info in net_positions.items():
         if pos_info["position_side"] == "FLAT" or pos_info["abs_quantity"] <= 0:
-            logger.info(f"Leg {sym} for Trade #{trade.id} already has net 0 open position. Skipping square-off.")
+            logger.info(f"Leg {sym} for Trade #{trade.id} has net 0 open position (e.g. unfilled limit order or flat). Skipping square-off.")
             continue
 
         net_qty = pos_info["abs_quantity"]
@@ -1148,7 +1433,13 @@ def process_trade_actions_and_sizing(
     return actions_to_add
 
 
-def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = False) -> list:
+def execute_trade_actions(
+    session: Session,
+    trade_id: int,
+    auto_mode: bool = False,
+    actions: Optional[List[Action]] = None,
+    allow_failed_retry: bool = False
+) -> list:
     """
     Executes Zerodha orders for pending actionable legs of a given trade with deduplication checks.
     Enforces strict execution ordering and two-phase verification for multi-leg / hedged setups:
@@ -1156,15 +1447,26 @@ def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = Fal
       - Phase 2: Waits for successful BUY confirmation before placing SELL (short/main) legs to guarantee
                  Zerodha / exchange margin relief (~35k vs ~1.5L) and prevent unhedged naked short exposure.
     If auto_mode is True, checks AUTO_PLACE_ORDERS for entry actions and AUTO_PLACE_EXIT_ORDERS for exit actions.
+    If allow_failed_retry is False (default), terminal FAILED actions are never automatically re-submitted.
     """
     auto_entry = os.getenv("AUTO_PLACE_ORDERS", "false").lower() in ("true", "1", "t", "yes")
     auto_exit = os.getenv("AUTO_PLACE_EXIT_ORDERS", "false").lower() in ("true", "1", "t", "yes")
 
-    actions = session.query(Action).filter(
-        Action.trade_id == trade_id,
-        Action.order_status.in_(["PENDING", "FAILED"]),
-        Action.action_type.in_(["BUY", "SELL", "EXIT", "CLOSE_LEG"])
-    ).all()
+    target_statuses = ["PENDING", "FAILED"] if allow_failed_retry else ["PENDING"]
+
+    if actions is None:
+        actions = session.query(Action).filter(
+            Action.trade_id == trade_id,
+            Action.order_status.in_(target_statuses),
+            Action.action_type.in_(["BUY", "SELL", "EXIT", "CLOSE_LEG"])
+        ).all()
+    else:
+        target_status_set = set(target_statuses)
+        actions = [
+            act for act in actions
+            if (act.order_status or "PENDING") in target_status_set
+            and act.action_type in ["BUY", "SELL", "EXIT", "CLOSE_LEG"]
+        ]
 
     if not actions:
         return []
@@ -1261,8 +1563,11 @@ def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = Fal
 
         if dedup_check["duplicate"]:
             logger.info(f"Action ID {action.id} skipped via Zerodha deduplication: {dedup_check['message']}")
-            action.order_status = "PLACED" if dedup_check["reason"] != "position_already_closed" else "EXECUTED"
+            dedup_st = "FILLED" if dedup_check["reason"] in ["position_already_closed", "position_already_open"] else "OPEN_LIMIT"
+            action.order_status = dedup_st
+            action.filled_quantity = action.quantity if dedup_st == "FILLED" else 0
             action.zerodha_response = f"Deduplicated: {dedup_check['message']}"
+            action.last_reconciled_at = datetime.utcnow()
             if dedup_check.get("order_id"):
                 action.zerodha_order_id = dedup_check["order_id"]
             session.commit()
@@ -1277,6 +1582,7 @@ def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = Fal
                     "tradingsymbol": action.tradingsymbol,
                     "reason": dedup_check["reason"],
                     "order_id": action.zerodha_order_id,
+                    "order_status": action.order_status,
                     "message": dedup_check["message"]
                 },
                 session=session
@@ -1288,6 +1594,7 @@ def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = Fal
                 "success": True,
                 "confirmed": True,
                 "order_id": action.zerodha_order_id or "DEDUPLICATED",
+                "status": action.order_status,
                 "message": dedup_check["message"]
             }
 
@@ -1318,10 +1625,16 @@ def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = Fal
         )
 
         if res["success"]:
-            action.order_status = "PLACED"
+            st_name = res.get("status") or "SUBMITTED"
+            action.order_status = st_name
             action.zerodha_order_id = res["order_id"]
             action.zerodha_response = res["message"]
             action.placed_at = datetime.utcnow()
+            action.filled_quantity = int(res.get("filled_quantity", 0) or 0)
+            action.pending_quantity = int(res.get("pending_quantity", (action.quantity or 0) - (action.filled_quantity or 0)) or 0)
+            action.average_price = float(res.get("average_price", 0.0) or 0.0)
+            action.last_reconciled_at = datetime.utcnow()
+
             record_stage(
                 stage="ORDER_PLACED",
                 status="SUCCESS",
@@ -1334,7 +1647,11 @@ def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = Fal
                     "quantity": action.quantity,
                     "order_type": action.order_type,
                     "price": limit_price,
-                    "order_id": res["order_id"]
+                    "order_id": res["order_id"],
+                    "order_status": action.order_status,
+                    "filled_quantity": action.filled_quantity,
+                    "pending_quantity": action.pending_quantity,
+                    "average_price": action.average_price
                 },
                 session=session
             )
@@ -1345,13 +1662,20 @@ def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = Fal
                 "success": True,
                 "confirmed": True,
                 "order_id": res["order_id"],
+                "status": action.order_status,
+                "filled_quantity": action.filled_quantity,
+                "pending_quantity": action.pending_quantity,
+                "average_price": action.average_price,
                 "message": res["message"]
             }
         else:
-            action.order_status = "FAILED"
+            failed_st = res.get("status") or "FAILED"
+            action.order_status = failed_st if failed_st in ["REJECTED", "CANCELLED", "FAILED"] else "FAILED"
             action.zerodha_response = res["message"]
+            action.rejection_reason = res.get("status_message") or res["message"]
+            action.last_reconciled_at = datetime.utcnow()
             record_stage(
-                stage="ORDER_FAILED",
+                stage="ORDER_FAILED" if action.order_status == "FAILED" else "ORDER_REJECTED",
                 status="ERROR",
                 message_id=action.message_id,
                 trade_id=action.trade_id,
@@ -1362,7 +1686,9 @@ def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = Fal
                     "transaction_type": action.transaction_type,
                     "quantity": action.quantity,
                     "order_type": action.order_type,
-                    "price": limit_price
+                    "price": limit_price,
+                    "order_status": action.order_status,
+                    "rejection_reason": action.rejection_reason
                 },
                 session=session
             )
@@ -1373,6 +1699,7 @@ def execute_trade_actions(session: Session, trade_id: int, auto_mode: bool = Fal
                 "success": False,
                 "confirmed": False,
                 "order_id": res.get("order_id"),
+                "status": action.order_status,
                 "message": res["message"]
             }
 
@@ -1462,11 +1789,13 @@ def setup_telegram_event_handlers():
     if not client:
         return
 
-    @client.on(events.CallbackQuery(pattern=r"^place_order:(\d+)$"))
+    @client.on(events.CallbackQuery(pattern=r"^(?:place_order|retry_order):(\d+)$"))
     async def on_place_order_callback(event):
         try:
-            trade_id = int(event.data.decode().split(":")[1])
-            logger.info(f"Telegram user clicked 'Place Order(s)' button for Trade ID {trade_id}")
+            data_str = event.data.decode() if isinstance(event.data, bytes) else str(event.data)
+            trade_id = int(data_str.split(":")[1])
+            is_retry = data_str.startswith("retry_order:")
+            logger.info(f"Telegram user clicked {'Retry' if is_retry else 'Place Order(s)'} button for Trade ID {trade_id}")
             await event.answer("Processing Zerodha order placement...", alert=False)
 
             session = db.SessionLocal()
@@ -1475,7 +1804,7 @@ def setup_telegram_event_handlers():
                     stage="TELEGRAM_BUTTON_CLICKED",
                     status="INFO",
                     trade_id=trade_id,
-                    details={"action": "place_order", "trade_id": trade_id},
+                    details={"action": "retry_order" if is_retry else "place_order", "trade_id": trade_id},
                     session=session
                 )
 
@@ -1485,11 +1814,20 @@ def setup_telegram_event_handlers():
                     return
 
                 with StageContext("MANUAL_ORDER_EXECUTION", trade_id=trade_id, session=session) as ctx:
-                    results = execute_trade_actions(session, trade_id)
-                    ctx.set_details({"trade_id": trade_id, "results": results})
+                    # Check if pending actions exist
+                    pending_acts = session.query(Action).filter(
+                        Action.trade_id == trade_id,
+                        Action.order_status == "PENDING",
+                        Action.action_type.in_(["BUY", "SELL", "EXIT", "CLOSE_LEG"])
+                    ).all()
+
+                    # Dedicated manual retry workflow allows retrying FAILED actions if explicitly requested or if no pending orders
+                    allow_failed = is_retry or (len(pending_acts) == 0)
+                    results = execute_trade_actions(session, trade_id, auto_mode=False, allow_failed_retry=allow_failed)
+                    ctx.set_details({"trade_id": trade_id, "results": results, "allow_failed_retry": allow_failed, "is_retry": is_retry})
 
                 if not results:
-                    await event.respond(f"ℹ️ No pending orders found for Trade #{trade_id} or orders already placed.")
+                    await event.respond(f"ℹ️ No pending or retriable orders found for Trade #{trade_id} (or orders already placed).")
                     return
 
                 # Format results summary message
@@ -2087,7 +2425,7 @@ async def process_single_message(session: Session, db_message: Message, actions_
     # 6. Automatic Order Placement Check
     with StageContext("ORDER_EXECUTION", message_id=db_message.id, telegram_message_id=db_message.telegram_message_id, trade_id=trade.id, revision=rev, session=session) as ctx:
         logger.info(f"Running automated order placement check for Trade ID {trade.id}...")
-        exec_results = execute_trade_actions(session, trade.id, auto_mode=True)
+        exec_results = execute_trade_actions(session, trade.id, auto_mode=True, actions=db_actions, allow_failed_retry=False)
         failed_orders = [r for r in exec_results if not r.get("success")]
         if failed_orders:
             ctx.set_warning(f"{len(failed_orders)} orders failed: {', '.join(r.get('message', '') for r in failed_orders)}")
@@ -2151,7 +2489,7 @@ async def process_single_message(session: Session, db_message: Message, actions_
                     logger.warning(f"Sending Important Notice for {len(unexecuted_actions)} unexecuted action(s) in Trade #{trade.id}")
                     notice_msg = format_important_notice_telegram_html(trade, unexecuted_actions)
                     
-                    notice_buttons = [Button.inline("🚀 Retry / Place Order(s)", data=f"place_order:{trade.id}")]
+                    notice_buttons = [Button.inline("🚀 Retry / Place Order(s)", data=f"retry_order:{trade.id}")]
                     await client.send_message(actions_entity, notice_msg, parse_mode='html', buttons=notice_buttons)
                     
                     record_stage(
@@ -2304,7 +2642,7 @@ async def check_active_spot_stoplosses(actions_entity=None, session: Optional[Se
 
                     # Execute square off orders immediately (emergency market exit)
                     auto_sl_exit = os.getenv("AUTO_EXECUTE_STOPLOSS_EXITS", "true").lower() in ("true", "1", "t", "yes")
-                    exec_results = execute_trade_actions(s, trade.id, auto_mode=not auto_sl_exit)
+                    exec_results = execute_trade_actions(s, trade.id, auto_mode=not auto_sl_exit, actions=sq_actions, allow_failed_retry=False)
 
                     trigger_result = {
                         "trade_id": trade.id,
@@ -2490,6 +2828,9 @@ async def sync_and_process():
                         session=session
                     )
 
+        # Reconcile active orders with Zerodha order book before and after sync
+        reconcile_active_orders(session)
+
         # Check active underlying spot stoplosses before and after sync
         await check_active_spot_stoplosses(actions_entity, session=session)
 
@@ -2500,7 +2841,8 @@ async def sync_and_process():
             for db_message in unanalysed_messages:
                 await process_single_message(session, db_message, actions_entity)
 
-        # Check active underlying spot stoplosses after processing messages
+        # Reconcile active orders and check spot stoplosses after processing messages
+        reconcile_active_orders(session)
         await check_active_spot_stoplosses(actions_entity, session=session)
 
     except Exception as e:

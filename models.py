@@ -84,7 +84,12 @@ class Action(Base):
     transaction_type = Column(String, nullable=True)  # "BUY" or "SELL"
     order_type = Column(String, nullable=True)        # "MARKET" or "LIMIT"
     product = Column(String, default="NRML")           # "NRML" or "MIS"
-    order_status = Column(String, default="PENDING", index=True)  # "PENDING", "PLACED", "FAILED", "EXECUTED", "CANCELLED"
+    order_status = Column(String, default="PENDING", index=True)  # "PENDING", "SUBMITTED", "OPEN_LIMIT", "TRIGGER_PENDING", "PARTIAL_FILL", "FILLED", "EXECUTED", "REJECTED", "CANCELLED", "FAILED", "PLACED"
+    filled_quantity = Column(Integer, default=0)       # Actual filled quantity confirmed by broker/exchange
+    pending_quantity = Column(Integer, default=0)      # Unfilled quantity remaining open on exchange
+    average_price = Column(Float, nullable=True)       # Executed average fill price
+    last_reconciled_at = Column(DateTime, nullable=True)# Timestamp of last active broker status sync
+    rejection_reason = Column(Text, nullable=True)     # Rejection / cancellation reason from broker RMS
     zerodha_order_id = Column(String, nullable=True)
     zerodha_response = Column(Text, nullable=True)
     placed_at = Column(DateTime, nullable=True)

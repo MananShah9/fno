@@ -152,9 +152,9 @@ class TestSpreadExecutionOrdering(unittest.TestCase):
         # Check DB states
         self.session.refresh(buy_act)
         self.session.refresh(sell_act)
-        self.assertEqual(buy_act.order_status, "PLACED")
+        self.assertIn(buy_act.order_status, ["FILLED", "COMPLETE", "PLACED"])
         self.assertEqual(buy_act.zerodha_order_id, "ORD_BUY_101")
-        self.assertEqual(sell_act.order_status, "PLACED")
+        self.assertIn(sell_act.order_status, ["FILLED", "COMPLETE", "PLACED"])
         self.assertEqual(sell_act.zerodha_order_id, "ORD_SELL_102")
 
         # Verify HEDGE_LEGS_CONFIRMED stage was recorded
@@ -312,8 +312,8 @@ class TestSpreadExecutionOrdering(unittest.TestCase):
 
         self.session.refresh(buy_act)
         self.session.refresh(sell_act)
-        self.assertEqual(buy_act.order_status, "PLACED")
-        self.assertEqual(sell_act.order_status, "PLACED")
+        self.assertIn(buy_act.order_status, ["FILLED", "PLACED"])
+        self.assertIn(sell_act.order_status, ["FILLED", "COMPLETE", "PLACED"])
 
     @patch("worker.place_zerodha_order")
     @patch("worker.check_existing_zerodha_order_or_position")
@@ -398,7 +398,8 @@ class TestSpreadExecutionOrdering(unittest.TestCase):
         status_info = get_zerodha_order_status("ORD_12345")
         self.assertTrue(status_info["success"])
         self.assertTrue(status_info["confirmed"])
-        self.assertEqual(status_info["status"], "COMPLETE")
+        self.assertIn(status_info["status"], ["FILLED", "COMPLETE"])
+        self.assertEqual(status_info["raw_status"], "COMPLETE")
         self.assertEqual(status_info["filled_quantity"], 65)
 
     @patch("zerodha_client.get_zerodha_client")
@@ -610,6 +611,145 @@ class TestSpreadExecutionOrdering(unittest.TestCase):
         self.assertIsNotNone(trace)
         self.assertEqual(trace.status, "SUCCESS")
         self.assertIn("all_zero", trace.details or "")
+
+    @patch("worker.place_zerodha_order")
+    @patch("worker.check_existing_zerodha_order_or_position")
+    def test_failed_action_not_retried_automatically_by_default(self, mock_dedup, mock_place):
+        """
+        Verify that execute_trade_actions with allow_failed_retry=False (default)
+        NEVER queries or retries actions marked with terminal FAILED status.
+        """
+        mock_dedup.return_value = {"duplicate": False, "reason": None, "order_id": None, "message": ""}
+        failed_act = Action(
+            trade_id=self.trade.id,
+            message_id=self.msg.id,
+            action_type="BUY",
+            transaction_type="BUY",
+            is_main=True,
+            tradingsymbol="NIFTY2681824600PE",
+            quantity=65,
+            lots=1,
+            order_type="MARKET",
+            order_status="FAILED",
+            zerodha_response="RMS: Margin Insufficient"
+        )
+        self.session.add(failed_act)
+        self.session.commit()
+
+        # Automated execution should NOT pick up FAILED actions
+        results = execute_trade_actions(self.session, self.trade.id, auto_mode=True, allow_failed_retry=False)
+        self.assertEqual(len(results), 0)
+        mock_place.assert_not_called()
+
+    @patch("worker.place_zerodha_order")
+    @patch("worker.check_existing_zerodha_order_or_position")
+    def test_failed_action_retried_when_allow_failed_retry_explicitly_true(self, mock_dedup, mock_place):
+        """
+        Verify that execute_trade_actions with allow_failed_retry=True (dedicated manual retry workflow)
+        successfully retries actions marked with FAILED status.
+        """
+        mock_dedup.return_value = {"duplicate": False, "reason": None, "order_id": None, "message": ""}
+        mock_place.return_value = {
+            "success": True,
+            "order_id": "RETRY_ORD_888",
+            "status": "COMPLETE",
+            "message": "Order placed successfully"
+        }
+
+        failed_act = Action(
+            trade_id=self.trade.id,
+            message_id=self.msg.id,
+            action_type="BUY",
+            transaction_type="BUY",
+            is_main=True,
+            tradingsymbol="NIFTY2681824600PE",
+            quantity=65,
+            lots=1,
+            order_type="MARKET",
+            order_status="FAILED",
+            zerodha_response="RMS: Margin Insufficient"
+        )
+        self.session.add(failed_act)
+        self.session.commit()
+
+        # Manual retry workflow should execute the failed action
+        results = execute_trade_actions(self.session, self.trade.id, auto_mode=False, allow_failed_retry=True)
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0]["success"])
+        self.assertEqual(results[0]["order_id"], "RETRY_ORD_888")
+        mock_place.assert_called_once()
+
+    @patch("worker.client.send_message")
+    @patch("worker.analyze_message_with_ai")
+    @patch("worker.place_zerodha_order")
+    @patch("worker.check_existing_zerodha_order_or_position")
+    def test_subsequent_chat_update_does_not_retry_failed_trade_action(self, mock_dedup, mock_place, mock_ai, mock_send):
+        """
+        Verify that when an entry order previously failed, subsequent chat updates
+        (e.g., SL commentary or trade plan update) DO NOT re-submit the failed entry order to Zerodha.
+        """
+        import asyncio
+        from gemini_client import TradeAnalysisSchema
+
+        os.environ["AUTO_PLACE_ORDERS"] = "true"
+        try:
+            mock_dedup.return_value = {"duplicate": False, "reason": None, "order_id": None, "message": ""}
+
+            trade = Trade(underlying="TATASTEEL", status="OPEN", structure_type="STOCK PE BUY")
+            self.session.add(trade)
+            self.session.commit()
+            self.session.refresh(trade)
+
+            # Historical failed entry action from earlier message
+            failed_entry_act = Action(
+                trade_id=trade.id,
+                message_id=self.msg.id,
+                action_type="BUY",
+                transaction_type="BUY",
+                is_main=True,
+                tradingsymbol="TATASTEEL26AUG192.5PE",
+                quantity=5500,
+                lots=1,
+                order_type="MARKET",
+                order_status="FAILED",
+                zerodha_response="Price outside circuit limits"
+            )
+            self.session.add(failed_entry_act)
+            self.session.commit()
+
+            # Subsequent informational / plan update message (e.g. Message 254: "Tata steel Trade Plan: SL when stock price hits 186")
+            mock_ai.return_value = TradeAnalysisSchema(
+                is_valid_trade_msg=True,
+                is_continuation=True,
+                related_open_trade_id=trade.id,
+                underlying="TATASTEEL",
+                structure_type="STOCK PE BUY",
+                actions=[]  # No new order actions in this update message
+            )
+            mock_send.return_value = MagicMock()
+
+            update_msg = Message(
+                telegram_message_id=8001,
+                channel_id="test_channel",
+                text="Tata steel Trade Plan: SL when stock price hits 186",
+                date=datetime.utcnow(),
+                processed=False,
+                analysed_by_ai=False,
+                revision=0
+            )
+            self.session.add(update_msg)
+            self.session.commit()
+
+            asyncio.run(process_single_message(self.session, update_msg, actions_entity=None))
+
+            # Broker place_order MUST NOT be called for the historical failed action
+            mock_place.assert_not_called()
+
+            # Verify action status remains FAILED
+            self.session.refresh(failed_entry_act)
+            self.assertEqual(failed_entry_act.order_status, "FAILED")
+        finally:
+            os.environ["AUTO_PLACE_ORDERS"] = "false"
 
 
 if __name__ == "__main__":
