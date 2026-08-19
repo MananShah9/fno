@@ -8,6 +8,7 @@ from typing import Optional, Dict, Any, List
 import requests
 import pyotp
 from kiteconnect import KiteConnect
+from instruments_manager import get_spot_instrument_key, is_index_symbol
 
 logger = logging.getLogger("zerodha")
 
@@ -186,6 +187,50 @@ def get_nfo_ltp(tradingsymbol: str) -> Optional[float]:
     except Exception as e:
         logger.warning(f"Could not fetch live LTP for {tradingsymbol}: {e}")
     return None
+
+def get_spot_ltp(underlying: str) -> Optional[float]:
+    """
+    Fetches the live Last Traded Price (LTP) for an underlying cash/spot index or stock from Zerodha.
+    Examples:
+      'NIFTY' -> queries 'NSE:NIFTY 50'
+      'BANKNIFTY' -> queries 'NSE:NIFTY BANK'
+      'TATASTEEL' -> queries 'NSE:TATASTEEL'
+      'VBL' -> queries 'NSE:VBL'
+    Returns float price or None if unavailable.
+    """
+    if not underlying:
+        return None
+    key = get_spot_instrument_key(underlying)
+    if not key:
+        return None
+    try:
+        kite = get_zerodha_client()
+        res = kite.ltp(key)
+        if res and key in res and "last_price" in res[key]:
+            return float(res[key]["last_price"])
+    except Exception as e:
+        logger.warning(f"Could not fetch live spot LTP for {underlying} (key: {key}): {e}")
+    return None
+
+def get_multiple_ltp(keys: List[str]) -> Dict[str, float]:
+    """
+    Fetches live LTPs for multiple instrument keys in a single Kite API call.
+    Returns dict: {instrument_key: float_price, ...}
+    """
+    if not keys:
+        return {}
+    try:
+        kite = get_zerodha_client()
+        res = kite.ltp(keys)
+        out = {}
+        if res and isinstance(res, dict):
+            for k, v in res.items():
+                if isinstance(v, dict) and "last_price" in v:
+                    out[k] = float(v["last_price"])
+        return out
+    except Exception as e:
+        logger.warning(f"Could not fetch multiple LTPs for {keys}: {e}")
+        return {}
 
 def check_existing_zerodha_order_or_position(
     tradingsymbol: str,
@@ -560,6 +605,26 @@ def place_zerodha_order(
         prod = prod_map.get(product.upper(), kite.PRODUCT_NRML)
 
         logger.info(f"Placing Zerodha Order via Proxy: {tt} {quantity} x {tradingsymbol} ({ot})")
+
+        # Safety Gate: Prevent spot index/stock trigger prices from being sent to exchange SL on option contracts
+        if trigger_price is not None and ot in [kite.ORDER_TYPE_SL, kite.ORDER_TYPE_SLM]:
+            sym_upper = str(tradingsymbol).strip().upper()
+            is_opt = sym_upper.endswith("CE") or sym_upper.endswith("PE")
+            if is_opt:
+                is_idx = any(sym_upper.startswith(idx) for idx in ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX"])
+                if (is_idx and trigger_price > 1500) or (price and trigger_price > 10.0 * float(price)):
+                    err_msg = (
+                        f"Exchange SL rejected before submission: Trigger price {trigger_price} appears to be underlying spot level for option {tradingsymbol}. "
+                        f"Exchange SL orders on options cannot accept underlying spot prices. Routed to Active Spot Monitoring Loop."
+                    )
+                    logger.error(err_msg)
+                    return {
+                        "success": False,
+                        "order_id": None,
+                        "status": "REJECTED",
+                        "message": err_msg,
+                        "status_message": err_msg
+                    }
 
         try:
             order_id = kite.place_order(

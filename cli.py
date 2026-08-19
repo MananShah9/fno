@@ -393,6 +393,14 @@ def view_trade_details(trade_id: int, session: Session):
             if getattr(act, "is_adjustment", False):
                 role = f"Adj #{act.adjustment_number or 1}"
             qty_str = f"{act.quantity} ({act.lots or 1}L)" if act.quantity else "N/A"
+            sl_str = "N/A"
+            if act.stoploss:
+                if getattr(act, "sl_trigger_type", None) == "UNDERLYING_SPOT_TRIGGER":
+                    sl_str = f"{act.stoploss} (Spot📡)"
+                elif getattr(act, "sl_trigger_type", None) == "OPTION_PREMIUM_TRIGGER":
+                    sl_str = f"{act.stoploss} (Opt🎯)"
+                else:
+                    sl_str = str(act.stoploss)
             actions_data.append([
                 act.id,
                 act.action_type,
@@ -400,7 +408,7 @@ def view_trade_details(trade_id: int, session: Session):
                 act.tradingsymbol or act.instrument_name or "N/A",
                 qty_str,
                 act.price or "N/A",
-                act.stoploss or "N/A",
+                sl_str,
                 act.target or "N/A",
                 act.order_status or "PENDING",
                 "✅ Yes" if act.telegram_sent else "❌ No"
@@ -423,6 +431,14 @@ def view_all_actions():
                 if getattr(act, "is_adjustment", False):
                     role = f"Adj #{act.adjustment_number or 1}"
                 qty_str = f"{act.quantity} ({act.lots or 1}L)" if act.quantity else "N/A"
+                sl_str = "N/A"
+                if act.stoploss:
+                    if getattr(act, "sl_trigger_type", None) == "UNDERLYING_SPOT_TRIGGER":
+                        sl_str = f"{act.stoploss} (Spot📡)"
+                    elif getattr(act, "sl_trigger_type", None) == "OPTION_PREMIUM_TRIGGER":
+                        sl_str = f"{act.stoploss} (Opt🎯)"
+                    else:
+                        sl_str = str(act.stoploss)
                 table_data.append([
                     act.id,
                     f"Trade #{act.trade_id}" if act.trade_id else "N/A",
@@ -431,7 +447,7 @@ def view_all_actions():
                     act.tradingsymbol or act.instrument_name or "N/A",
                     qty_str,
                     act.price or "N/A",
-                    act.stoploss or "N/A",
+                    sl_str,
                     act.target or "N/A",
                     act.order_status or "PENDING",
                     "✅ Yes" if act.telegram_sent else "❌ No"

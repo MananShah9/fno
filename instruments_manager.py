@@ -205,6 +205,43 @@ KNOWN_INDEX_SYMBOLS = {
     "SENSEX", "BANKEX", "NIFTYIT", "NIFTY50", "NIFTYBANK", "CNXNIFTY", "CNXIT", "CNXFINANCE"
 }
 
+# Zerodha Kite Connect spot instrument quote key mappings for indices
+INDEX_SPOT_KEY_MAP = {
+    "NIFTY": "NSE:NIFTY 50",
+    "NIFTY50": "NSE:NIFTY 50",
+    "NIFTY 50": "NSE:NIFTY 50",
+    "BANKNIFTY": "NSE:NIFTY BANK",
+    "NIFTYBANK": "NSE:NIFTY BANK",
+    "NIFTY BANK": "NSE:NIFTY BANK",
+    "FINNIFTY": "NSE:NIFTY FIN SERVICE",
+    "CNXFINANCE": "NSE:NIFTY FIN SERVICE",
+    "MIDCPNIFTY": "NSE:NIFTY MID SELECT",
+    "NIFTYNXT50": "NSE:NIFTY NEXT 50",
+    "SENSEX": "BSE:SENSEX",
+    "BANKEX": "BSE:BANKEX"
+}
+
+def get_spot_instrument_key(underlying: Optional[str]) -> Optional[str]:
+    """
+    Returns the Zerodha Kite Connect instrument quote key for the underlying spot/cash index or stock.
+    Examples:
+      'NIFTY' -> 'NSE:NIFTY 50'
+      'BANKNIFTY' -> 'NSE:NIFTY BANK'
+      'SENSEX' -> 'BSE:SENSEX'
+      'TATASTEEL' -> 'NSE:TATASTEEL'
+      'VBL' -> 'NSE:VBL'
+    """
+    if not underlying:
+        return None
+    raw_u = str(underlying).strip().upper()
+    clean = re.sub(r'[^A-Z0-9]', '', raw_u)
+    for k, v in INDEX_SPOT_KEY_MAP.items():
+        clean_k = re.sub(r'[^A-Z0-9]', '', k)
+        if clean == clean_k or clean.startswith(clean_k):
+            return v
+    # Default to NSE stock symbol
+    return f"NSE:{clean}"
+
 # Default estimated margin tiers in INR per lot (used as fallbacks when broker API is unavailable)
 DEFAULT_MARGIN_TIERS = {
     "INDEX_SPREAD": 40000.0,            # e.g., Nifty/BankNifty Hedged Credit/Debit Spreads (~35k-50k)

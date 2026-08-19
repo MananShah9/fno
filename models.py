@@ -89,6 +89,16 @@ class Action(Base):
     zerodha_response = Column(Text, nullable=True)
     placed_at = Column(DateTime, nullable=True)
 
+    # Stoploss Dual-Classification & Spot Monitoring Parameters
+    sl_trigger_type = Column(String, nullable=True, index=True)        # "OPTION_PREMIUM_TRIGGER" or "UNDERLYING_SPOT_TRIGGER"
+    sl_trigger_price = Column(Float, nullable=True)                    # Numeric trigger price level
+    sl_trigger_direction = Column(String, nullable=True)                # "ABOVE" or "BELOW"
+    sl_monitoring_active = Column(Boolean, default=False, index=True)  # True if actively monitored in spot tracking loop
+    sl_triggered = Column(Boolean, default=False, index=True)          # True if SL trigger condition was met
+    sl_triggered_at = Column(DateTime, nullable=True)                  # Timestamp when trigger condition was met
+    sl_order_id = Column(String, nullable=True)                        # Broker SL order ID if placed directly
+    sl_order_status = Column(String, nullable=True)                    # "MONITORING", "TRIGGERED", "PLACED", "FAILED", "CANCELLED"
+
     # Relationships
     trade = relationship("Trade", back_populates="actions")
     message = relationship("Message", back_populates="actions")

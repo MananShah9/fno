@@ -12,15 +12,16 @@ from telethon import events, Button, utils
 import db
 from models import Message, Trade, Action
 from telegram_client import client, check_login, get_channel_entity
-from gemini_client import analyze_message_with_ai, clean_symbol, is_poke_message
+from gemini_client import analyze_message_with_ai, clean_symbol, is_poke_message, classify_sl_trigger
 from instruments_manager import (
     resolve_nfo_instrument, parse_price_value, calculate_lots_from_budget,
     calculate_position_size, classify_strategy_type, get_margin_tier_estimate,
-    get_max_lot_cap, is_index_symbol
+    get_max_lot_cap, is_index_symbol, get_spot_instrument_key
 )
 from zerodha_client import (
     place_zerodha_order, check_existing_zerodha_order_or_position, get_nfo_ltp,
-    calculate_basket_margin, verify_zerodha_order_confirmation, get_zerodha_order_status,
+    get_spot_ltp, get_multiple_ltp, calculate_basket_margin,
+    verify_zerodha_order_confirmation, get_zerodha_order_status,
     get_zerodha_net_positions, verify_zerodha_positions_zero
 )
 from stage_tracker import record_stage, StageContext, get_code_location
@@ -61,6 +62,10 @@ def get_open_trades_context(session: Session):
                 "quantity": action.quantity,
                 "price": action.price,
                 "stoploss": action.stoploss,
+                "sl_trigger_type": getattr(action, "sl_trigger_type", None),
+                "sl_trigger_price": getattr(action, "sl_trigger_price", None),
+                "sl_trigger_direction": getattr(action, "sl_trigger_direction", None),
+                "sl_monitoring_active": getattr(action, "sl_monitoring_active", False) or False,
                 "target": action.target,
                 "details": action.details
             })
@@ -358,6 +363,38 @@ def format_important_notice_telegram_html(trade: Trade, unexecuted_actions: list
     return "\n".join(msg_parts)
 
 
+def format_spot_sl_triggered_telegram_html(trade: Trade, action: Action, spot_ltp: float, exec_results: list) -> str:
+    """
+    Formats a high-priority alert when an underlying cash/spot index or stock stop-loss threshold
+    is crossed, triggering emergency market square-off of open positions.
+    """
+    msg_parts = [
+        "🛡️ <b>STOP-LOSS TRIGGERED (UNDERLYING SPOT HIT)</b> 🚨\n",
+        f"<b>Trade ID:</b> #{trade.id}",
+        f"<b>Underlying:</b> {trade.underlying or 'N/A'}"
+    ]
+    if trade.structure_type:
+        msg_parts.append(f"<b>Strategy:</b> {trade.structure_type}")
+
+    dir_text = "falling to/below" if getattr(action, "sl_trigger_direction", "BELOW") == "BELOW" else "rising to/above"
+    target_str = f"{action.sl_trigger_price:,.2f}" if action.sl_trigger_price is not None else str(action.stoploss)
+    msg_parts.append(f"\n📍 <b>Spot LTP:</b> <code>{spot_ltp:,.2f}</code> (Crossed SL threshold <code>{target_str}</code> {dir_text})")
+    if action.stoploss:
+        msg_parts.append(f"<b>Signal SL Rule:</b> <i>{action.stoploss}</i>")
+
+    msg_parts.append("\n🚪 <b>Emergency Square-Off Execution Results:</b>")
+    if exec_results:
+        for r in exec_results:
+            icon = "✅" if r.get("success") else "❌"
+            status_desc = f"Order ID: <code>{r.get('order_id')}</code>" if r.get("success") else f"Error: {r.get('message')}"
+            msg_parts.append(f"• {icon} <code>{r.get('tradingsymbol')}</code> -> {status_desc}")
+    else:
+        msg_parts.append("• ℹ️ Position square-off queued.")
+
+    msg_parts.append("\n✅ <b>Trade Status:</b> <code>CLOSED</code>")
+    return "\n".join(msg_parts)
+
+
 def format_action_telegram_message_html(trade: Trade, actions: list) -> str:
     """Formats actions into a beautiful Telegram HTML message with Zerodha execution info."""
     is_exit = any(a.action_type == 'EXIT' for a in actions)
@@ -419,7 +456,12 @@ def format_action_telegram_message_html(trade: Trade, actions: list) -> str:
         if action.price:
             detail_parts.append(f"Price: <code>{action.price}</code>")
         if action.stoploss:
-            detail_parts.append(f"SL: <code>{action.stoploss}</code>")
+            if getattr(action, "sl_trigger_type", None) == "UNDERLYING_SPOT_TRIGGER":
+                detail_parts.append(f"SL: <code>{action.stoploss}</code> (Spot Monitor 📡)")
+            elif getattr(action, "sl_trigger_type", None) == "OPTION_PREMIUM_TRIGGER":
+                detail_parts.append(f"SL: <code>{action.stoploss}</code> (Option Premium 🎯)")
+            else:
+                detail_parts.append(f"SL: <code>{action.stoploss}</code>")
         if action.target:
             detail_parts.append(f"Target: <code>{action.target}</code>")
             
@@ -665,6 +707,7 @@ def process_trade_actions_and_sizing(
         action_type = getattr(action_schema, "action_type", "INFO").upper()
 
         # Context-aware cross-referencing for exit actions
+        matched_pa = None
         if action_type in ["EXIT", "CLOSE_LEG"] and trade and getattr(trade, "actions", None):
             is_hedge_ref = (
                 getattr(action_schema, "is_main", None) is False or
@@ -680,15 +723,17 @@ def process_trade_actions_and_sizing(
                             o_type = pa.option_type or o_type
                             expiry_str = pa.expiry or expiry_str
                             u_symbol = pa.underlying or u_symbol
+                            matched_pa = pa
                             break
-            # 2. If strike is specified but option_type is missing/omitted, inherit from trade open leg
-            elif strike_val is not None and not o_type:
+            # 2. If strike is specified, inherit from trade open leg
+            elif strike_val is not None:
                 for pa in trade.actions:
                     if pa.action_type in ["BUY", "SELL"] and pa.order_status not in ["FAILED", "CANCELLED"]:
                         if pa.strike and abs(pa.strike - strike_val) < 0.01:
                             o_type = pa.option_type or o_type
                             expiry_str = pa.expiry or expiry_str
                             u_symbol = pa.underlying or u_symbol
+                            matched_pa = pa
                             break
             # 3. If strike is missing and single open leg exists, inherit from that open leg
             elif strike_val is None and not is_hedge_ref:
@@ -701,9 +746,23 @@ def process_trade_actions_and_sizing(
                     o_type = open_acts[0].option_type or o_type
                     expiry_str = open_acts[0].expiry or expiry_str
                     u_symbol = open_acts[0].underlying or u_symbol
+                    matched_pa = open_acts[0]
 
         o_type = o_type or "CE"
         inst = resolve_nfo_instrument(u_symbol, strike_val, o_type, expiry_str)
+        if not inst and matched_pa and matched_pa.tradingsymbol:
+            inst = {
+                "tradingsymbol": matched_pa.tradingsymbol,
+                "instrument_token": matched_pa.instrument_token,
+                "lot_size": int(matched_pa.quantity / (matched_pa.lots or 1)) if matched_pa.quantity and matched_pa.lots else 1,
+                "expiry": matched_pa.expiry,
+                "strike": matched_pa.strike,
+                "option_type": matched_pa.option_type
+            }
+        elif inst and matched_pa and matched_pa.tradingsymbol and not getattr(action_schema, "expiry_info", None):
+            inst["tradingsymbol"] = matched_pa.tradingsymbol
+            if matched_pa.instrument_token:
+                inst["instrument_token"] = matched_pa.instrument_token
 
         resolved_items.append({
             "schema": action_schema,
@@ -915,6 +974,29 @@ def process_trade_actions_and_sizing(
         # Resolve order type
         ord_type = "LIMIT" if (getattr(schema, "order_type", None) == "LIMIT" or getattr(schema, "is_limit", False)) else "MARKET"
 
+        # Resolve SL classification and parameters
+        raw_sl = getattr(schema, "stoploss", None)
+        sl_type = getattr(schema, "sl_trigger_type", None)
+        sl_price = getattr(schema, "sl_trigger_price", None)
+        sl_dir = getattr(schema, "sl_trigger_direction", None)
+
+        if raw_sl and (not sl_type or sl_price is None or not sl_dir):
+            sl_cls = classify_sl_trigger(
+                raw_stoploss=raw_sl,
+                underlying=item["underlying"],
+                strike=item["strike"],
+                option_type=o_type,
+                entry_price=getattr(schema, "price", None),
+                is_main=item["is_main"],
+                transaction_type=trans_type
+            )
+            sl_type = sl_cls["sl_trigger_type"]
+            sl_price = sl_cls["sl_trigger_price"]
+            sl_dir = sl_cls["sl_trigger_direction"]
+
+        is_spot_monitored = bool(sl_type == "UNDERLYING_SPOT_TRIGGER" and sl_price is not None)
+        sl_ord_status = "MONITORING" if is_spot_monitored else ("PENDING" if sl_type == "OPTION_PREMIUM_TRIGGER" else None)
+
         db_action = Action(
             trade_id=trade.id if trade else None,
             message_id=db_message_id,
@@ -924,7 +1006,13 @@ def process_trade_actions_and_sizing(
             adjustment_number=item.get("adjustment_number", None),
             instrument_name=getattr(schema, "instrument_name", None),
             price=getattr(schema, "price", None),
-            stoploss=getattr(schema, "stoploss", None),
+            stoploss=raw_sl,
+            sl_trigger_type=sl_type,
+            sl_trigger_price=sl_price,
+            sl_trigger_direction=sl_dir,
+            sl_monitoring_active=is_spot_monitored,
+            sl_triggered=False,
+            sl_order_status=sl_ord_status,
             target=getattr(schema, "target", None),
             is_limit=getattr(schema, "is_limit", False),
             details=getattr(schema, "details", None),
@@ -1722,6 +1810,45 @@ async def process_single_message(session: Session, db_message: Message, actions_
             session.add(db_action)
         session.commit()
 
+        # Record Stop-Loss Classification & Spot Monitoring Registration stages
+        for a in db_actions:
+            if getattr(a, "sl_trigger_type", None) == "UNDERLYING_SPOT_TRIGGER" and a.sl_trigger_price is not None:
+                record_stage(
+                    stage="SPOT_SL_MONITOR_REGISTERED",
+                    status="SUCCESS",
+                    message_id=db_message.id,
+                    telegram_message_id=db_message.telegram_message_id,
+                    trade_id=trade.id,
+                    revision=rev,
+                    details={
+                        "action_id": a.id,
+                        "underlying": a.underlying or trade.underlying,
+                        "sl_trigger_type": a.sl_trigger_type,
+                        "sl_trigger_price": a.sl_trigger_price,
+                        "sl_trigger_direction": a.sl_trigger_direction,
+                        "raw_stoploss": a.stoploss
+                    },
+                    session=session
+                )
+            elif getattr(a, "sl_trigger_type", None) == "OPTION_PREMIUM_TRIGGER" and a.sl_trigger_price is not None:
+                record_stage(
+                    stage="PREMIUM_SL_IDENTIFIED",
+                    status="INFO",
+                    message_id=db_message.id,
+                    telegram_message_id=db_message.telegram_message_id,
+                    trade_id=trade.id,
+                    revision=rev,
+                    details={
+                        "action_id": a.id,
+                        "tradingsymbol": a.tradingsymbol,
+                        "sl_trigger_type": a.sl_trigger_type,
+                        "sl_trigger_price": a.sl_trigger_price,
+                        "sl_trigger_direction": a.sl_trigger_direction,
+                        "raw_stoploss": a.stoploss
+                    },
+                    session=session
+                )
+
         unresolved = [a.instrument_name or a.action_type for a in db_actions if not a.tradingsymbol]
         if unresolved:
             ctx.set_warning(f"Could not resolve NFO tradingsymbol for: {', '.join(unresolved)}")
@@ -1736,7 +1863,10 @@ async def process_single_message(session: Session, db_message: Message, actions_
                     "is_main": a.is_main,
                     "quantity": a.quantity,
                     "lots": a.lots,
-                    "price": a.price
+                    "price": a.price,
+                    "sl_trigger_type": getattr(a, "sl_trigger_type", None),
+                    "sl_trigger_price": getattr(a, "sl_trigger_price", None),
+                    "sl_monitoring_active": getattr(a, "sl_monitoring_active", False)
                 }
                 for a in db_actions
             ]
@@ -1766,7 +1896,8 @@ async def process_single_message(session: Session, db_message: Message, actions_
     # 6b. Live Position Book Closure Verification (if trade is closed or exiting)
     if trade and (trade.status == "CLOSED" or analysis.trade_status_update == "CLOSED" or any(a.action_type in ["EXIT", "CLOSE_LEG"] for a in analysis.actions)):
         with StageContext("TRADE_POSITION_CLOSURE_VERIFICATION", message_id=db_message.id, telegram_message_id=db_message.telegram_message_id, trade_id=trade.id, revision=rev, session=session) as ctx:
-            trade_symbols = list({a.tradingsymbol for a in trade.actions if a.tradingsymbol})
+            all_trade_acts = session.query(Action).filter(Action.trade_id == trade.id, Action.tradingsymbol != None).all()
+            trade_symbols = list({a.tradingsymbol for a in all_trade_acts if a.tradingsymbol})
             if trade_symbols:
                 verif = verify_zerodha_positions_zero(trade_symbols)
                 if verif["verified"]:
@@ -1868,6 +1999,137 @@ async def process_single_message(session: Session, db_message: Message, actions_
         session=session
     )
     return True
+
+async def check_active_spot_stoplosses(actions_entity=None, session: Optional[Session] = None) -> List[Dict[str, Any]]:
+    """
+    Active Market-Data Monitoring Loop for Stop-Losses based on underlying cash/spot index or stock level.
+    Monitors live spot LTP for all open trades with Action.sl_monitoring_active == True.
+    When the spot threshold is crossed:
+      1. Marks action as sl_triggered=True and sl_monitoring_active=False.
+      2. Updates trade.status to 'CLOSED'.
+      3. Automatically executes market exits (square-off) across all open positions.
+      4. Dispatches immediate Telegram alert to actions_channel.
+    """
+    close_sess = False
+    s = session
+    if s is None:
+        s = db.SessionLocal()
+        close_sess = True
+
+    try:
+        monitored_actions = s.query(Action).join(Trade, Action.trade_id == Trade.id).filter(
+            Trade.status == "OPEN",
+            Action.sl_monitoring_active == True,
+            Action.sl_triggered == False,
+            Action.sl_trigger_type == "UNDERLYING_SPOT_TRIGGER",
+            Action.sl_trigger_price != None
+        ).all()
+
+        if not monitored_actions:
+            return []
+
+        results = []
+        trades_to_check = {}
+        for act in monitored_actions:
+            t_id = act.trade_id
+            if t_id not in trades_to_check:
+                trades_to_check[t_id] = {
+                    "trade": act.trade,
+                    "actions": []
+                }
+            trades_to_check[t_id]["actions"].append(act)
+
+        for trade_id, t_info in trades_to_check.items():
+            trade = t_info["trade"]
+            actions = t_info["actions"]
+            underlying = clean_symbol(trade.underlying) or (actions[0].underlying if actions else None)
+            if not underlying:
+                continue
+
+            spot_ltp = None
+            try:
+                spot_ltp = get_spot_ltp(underlying)
+            except Exception as le:
+                logger.warning(f"Failed to fetch live spot LTP for {underlying} during SL monitoring: {le}")
+
+            if spot_ltp is None or spot_ltp <= 0:
+                continue
+
+            for act in actions:
+                target_sl = act.sl_trigger_price
+                direction = (act.sl_trigger_direction or "BELOW").upper()
+                is_triggered = False
+
+                if direction == "BELOW" and spot_ltp <= target_sl:
+                    is_triggered = True
+                elif direction == "ABOVE" and spot_ltp >= target_sl:
+                    is_triggered = True
+
+                if is_triggered:
+                    logger.warning(
+                        f"[SPOT SL TRIGGERED] Trade #{trade.id} ({underlying}): "
+                        f"Current Spot LTP {spot_ltp:,.2f} crossed threshold {target_sl:,.2f} ({direction}). "
+                        f"Triggering immediate market exit across all positions!"
+                    )
+
+                    act.sl_triggered = True
+                    act.sl_monitoring_active = False
+                    act.sl_triggered_at = datetime.utcnow()
+                    act.sl_order_status = "TRIGGERED"
+
+                    trade.status = "CLOSED"
+                    trade.closed_at = datetime.utcnow()
+                    trade.context_summary = f"Trade closed: Spot SL triggered at {spot_ltp:,.2f} (Threshold: {target_sl:,.2f})"
+                    s.commit()
+
+                    record_stage(
+                        stage="SPOT_SL_TRIGGERED",
+                        status="SUCCESS",
+                        message_id=act.message_id,
+                        trade_id=trade.id,
+                        details={
+                            "trade_id": trade.id,
+                            "action_id": act.id,
+                            "underlying": underlying,
+                            "spot_ltp": spot_ltp,
+                            "sl_trigger_price": target_sl,
+                            "direction": direction,
+                            "stoploss_text": act.stoploss
+                        },
+                        session=s
+                    )
+
+                    # Generate emergency square-off actions
+                    sq_actions = ensure_square_off_actions(s, trade, db_message=act.message)
+
+                    # Execute square off orders immediately (emergency market exit)
+                    auto_sl_exit = os.getenv("AUTO_EXECUTE_STOPLOSS_EXITS", "true").lower() in ("true", "1", "t", "yes")
+                    exec_results = execute_trade_actions(s, trade.id, auto_mode=not auto_sl_exit)
+
+                    trigger_result = {
+                        "trade_id": trade.id,
+                        "action_id": act.id,
+                        "underlying": underlying,
+                        "spot_ltp": spot_ltp,
+                        "sl_trigger_price": target_sl,
+                        "direction": direction,
+                        "square_off_actions": len(sq_actions),
+                        "exec_results": exec_results
+                    }
+                    results.append(trigger_result)
+
+                    # Send Telegram alert if actions entity is present
+                    if actions_entity and client:
+                        try:
+                            alert_html = format_spot_sl_triggered_telegram_html(trade, act, spot_ltp, exec_results)
+                            await client.send_message(actions_entity, alert_html, parse_mode='html')
+                        except Exception as te:
+                            logger.error(f"Failed to send Spot SL Telegram alert: {te}")
+
+        return results
+    finally:
+        if close_sess and s:
+            s.close()
 
 async def sync_and_process():
     """Main worker iteration to sync messages and run Gemini processing."""
@@ -2028,12 +2290,18 @@ async def sync_and_process():
                         session=session
                     )
 
+        # Check active underlying spot stoplosses before and after sync
+        await check_active_spot_stoplosses(actions_entity, session=session)
+
         # 3. Process all unanalysed messages in chronological order
         unanalysed_messages = session.query(Message).filter(Message.analysed_by_ai == False).order_by(Message.id.asc()).all()
         if unanalysed_messages:
             logger.info(f"Found {len(unanalysed_messages)} unanalysed messages in DB. Processing...")
             for db_message in unanalysed_messages:
                 await process_single_message(session, db_message, actions_entity)
+
+        # Check active underlying spot stoplosses after processing messages
+        await check_active_spot_stoplosses(actions_entity, session=session)
 
     except Exception as e:
         logger.exception(f"Error in sync_and_process loop: {e}")

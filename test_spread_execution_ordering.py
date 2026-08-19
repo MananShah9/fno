@@ -550,9 +550,10 @@ class TestSpreadExecutionOrdering(unittest.TestCase):
         from gemini_client import TradeAnalysisSchema
 
         # Existing open trade in database with 1 leg
-        trade = Trade(id=301, underlying="NIFTY", status="OPEN", structure_type="NIFTY PE SPREAD")
+        trade = Trade(underlying="NIFTY", status="OPEN", structure_type="NIFTY PE SPREAD")
         self.session.add(trade)
         self.session.commit()
+        self.session.refresh(trade)
 
         entry_act = Action(
             trade_id=trade.id,
@@ -578,6 +579,8 @@ class TestSpreadExecutionOrdering(unittest.TestCase):
 
         mock_ai.return_value = TradeAnalysisSchema(
             is_valid_trade_msg=True,
+            is_continuation=True,
+            related_open_trade_id=trade.id,
             underlying="NIFTY",
             trade_status_update="CLOSED",
             actions=[]

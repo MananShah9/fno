@@ -92,7 +92,15 @@ def init_db():
             "order_status": "VARCHAR DEFAULT 'PENDING'",
             "zerodha_order_id": "VARCHAR",
             "zerodha_response": "TEXT",
-            "placed_at": "TIMESTAMP"
+            "placed_at": "TIMESTAMP",
+            "sl_trigger_type": "VARCHAR",
+            "sl_trigger_price": "DOUBLE PRECISION",
+            "sl_trigger_direction": "VARCHAR",
+            "sl_monitoring_active": "BOOLEAN DEFAULT FALSE",
+            "sl_triggered": "BOOLEAN DEFAULT FALSE",
+            "sl_triggered_at": "TIMESTAMP",
+            "sl_order_id": "VARCHAR",
+            "sl_order_status": "VARCHAR"
         }
 
         with engine.begin() as conn:
