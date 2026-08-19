@@ -20,7 +20,8 @@ from instruments_manager import (
 )
 from zerodha_client import (
     place_zerodha_order, check_existing_zerodha_order_or_position, get_nfo_ltp,
-    calculate_basket_margin, verify_zerodha_order_confirmation, get_zerodha_order_status
+    calculate_basket_margin, verify_zerodha_order_confirmation, get_zerodha_order_status,
+    get_zerodha_net_positions, verify_zerodha_positions_zero
 )
 from stage_tracker import record_stage, StageContext, get_code_location
 from time_filter import is_telegram_time_active, get_schedule_description
@@ -443,69 +444,146 @@ def format_action_telegram_message_html(trade: Trade, actions: list) -> str:
         
     return "\n".join(msg_parts)
 
+def compute_trade_net_positions(session: Optional[Session], trade: Union[Trade, int]) -> Dict[str, Dict[str, Any]]:
+    """
+    Computes the net active position balance directly by aggregating all filled/placed entry quantities
+    minus all filled/placed exit quantities for every instrument token / tradingsymbol within the trade.
+    Filters out FAILED or CANCELLED actions.
+
+    Returns:
+        dict: {
+            tradingsymbol: {
+                "instrument_token": int,
+                "tradingsymbol": str,
+                "net_quantity": int,       # positive for NET LONG, negative for NET SHORT, 0 for FLAT
+                "abs_quantity": int,       # abs(net_quantity)
+                "net_lots": int,           # computed lots based on instrument lot size
+                "position_side": str,      # "LONG", "SHORT", or "FLAT"
+                "required_exit_side": str, # "SELL" to close long, "BUY" to close short, None if FLAT
+                "template_action": Action, # representative Action object for leg metadata
+                "total_entry_qty": int,
+                "total_exit_qty": int,
+            },
+            ...
+        }
+    """
+    trade_id = trade.id if isinstance(trade, Trade) else trade
+    all_actions = []
+    if session and trade_id:
+        all_actions = session.query(Action).filter(
+            Action.trade_id == trade_id,
+            Action.order_status.notin_(["FAILED", "CANCELLED"]),
+            Action.tradingsymbol != None
+        ).order_by(Action.id.asc()).all()
+    elif isinstance(trade, Trade) and getattr(trade, "actions", None):
+        all_actions = [
+            a for a in trade.actions
+            if a.order_status not in ["FAILED", "CANCELLED"] and a.tradingsymbol
+        ]
+
+    pos_map = {}
+    for act in all_actions:
+        sym = act.tradingsymbol
+        if not sym:
+            continue
+        if sym not in pos_map:
+            pos_map[sym] = {
+                "instrument_token": act.instrument_token,
+                "tradingsymbol": sym,
+                "net_quantity": 0,
+                "abs_quantity": 0,
+                "net_lots": 0,
+                "position_side": "FLAT",
+                "required_exit_side": None,
+                "template_action": act,
+                "total_entry_qty": 0,
+                "total_exit_qty": 0,
+            }
+
+        qty = act.quantity or 0
+        tt = (act.transaction_type or act.action_type or "").upper()
+        is_entry = act.action_type in ["BUY", "SELL"]
+        is_exit = act.action_type in ["EXIT", "CLOSE_LEG"]
+
+        if is_entry:
+            pos_map[sym]["total_entry_qty"] += qty
+            if tt == "BUY":
+                pos_map[sym]["net_quantity"] += qty
+            elif tt == "SELL":
+                pos_map[sym]["net_quantity"] -= qty
+        elif is_exit:
+            pos_map[sym]["total_exit_qty"] += qty
+            if tt == "BUY":
+                pos_map[sym]["net_quantity"] += qty
+            elif tt == "SELL":
+                pos_map[sym]["net_quantity"] -= qty
+
+    # Compute derived sizing, lots, and required reverse transaction sides
+    for sym, info in pos_map.items():
+        net_q = info["net_quantity"]
+        info["abs_quantity"] = abs(net_q)
+        template_act = info["template_action"]
+
+        per_lot_qty = int(template_act.quantity / (template_act.lots or 1)) if template_act.quantity and template_act.lots else (template_act.quantity or 1)
+        info["net_lots"] = max(1, int(round(abs(net_q) / per_lot_qty))) if (per_lot_qty > 0 and abs(net_q) > 0) else (0 if net_q == 0 else (template_act.lots or 1))
+
+        if net_q > 0:
+            info["position_side"] = "LONG"
+            info["required_exit_side"] = "SELL"
+        elif net_q < 0:
+            info["position_side"] = "SHORT"
+            info["required_exit_side"] = "BUY"
+        else:
+            info["position_side"] = "FLAT"
+            info["required_exit_side"] = None
+
+    return pos_map
+
+
 def ensure_square_off_actions(session: Session, trade: Trade, db_message: Message, parsed_actions: list = None) -> list:
     """
-    Scans a trade's open entry legs and creates reverse square-off Action records
+    Scans a trade's net open positions and creates reverse square-off Action records
     if the trade is being closed or exited, computing net active quantities
-    to ensure 100% of initial and averaged lots are completely closed.
+    to ensure 100% of initial and averaged lots are completely closed without leaving orphaned legs.
     """
-    entry_actions = session.query(Action).filter(
-        Action.trade_id == trade.id,
-        Action.action_type.in_(["BUY", "SELL"]),
-        Action.tradingsymbol != None
-    ).order_by(Action.id.asc()).all()
-
-    if not entry_actions:
+    net_positions = compute_trade_net_positions(session, trade)
+    if not net_positions:
         return []
-
-    # Map aggregate entry quantity and lots per tradingsymbol
-    symbol_entry_map = {}
-    for entry_act in entry_actions:
-        sym = entry_act.tradingsymbol
-        if sym not in symbol_entry_map:
-            symbol_entry_map[sym] = {
-                "quantity": 0,
-                "lots": 0,
-                "transaction_type": (entry_act.transaction_type or entry_act.action_type).upper(),
-                "template_action": entry_act
-            }
-        symbol_entry_map[sym]["quantity"] += (entry_act.quantity or 0)
-        symbol_entry_map[sym]["lots"] += (entry_act.lots or 1)
-
-    # Find already existing exit actions for this trade
-    existing_exit_actions = session.query(Action).filter(
-        Action.trade_id == trade.id,
-        Action.action_type.in_(["EXIT", "CLOSE_LEG"])
-    ).all()
-    already_exited_qty = {}
-    for ex in existing_exit_actions:
-        if ex.tradingsymbol:
-            already_exited_qty[ex.tradingsymbol] = already_exited_qty.get(ex.tradingsymbol, 0) + (ex.quantity or 0)
 
     parsed_actions = parsed_actions or []
     new_square_off_actions = []
 
-    for sym, entry_info in symbol_entry_map.items():
-        net_qty = entry_info["quantity"] - already_exited_qty.get(sym, 0)
-        if net_qty <= 0:
-            logger.info(f"Leg {sym} for Trade #{trade.id} already has complete square-off coverage. Skipping.")
+    for sym, pos_info in net_positions.items():
+        if pos_info["position_side"] == "FLAT" or pos_info["abs_quantity"] <= 0:
+            logger.info(f"Leg {sym} for Trade #{trade.id} already has net 0 open position. Skipping square-off.")
             continue
 
-        entry_act = entry_info["template_action"]
-        per_lot_qty = int(entry_act.quantity / (entry_act.lots or 1)) if entry_act.quantity and entry_act.lots else (entry_act.quantity or 1)
-        net_lots = max(1, int(round(net_qty / per_lot_qty))) if per_lot_qty > 0 else entry_info["lots"]
-
-        # Determine reverse transaction type: SELL -> BUY, BUY -> SELL
-        original_tt = entry_info["transaction_type"]
-        reverse_tt = "BUY" if original_tt == "SELL" else "SELL"
+        net_qty = pos_info["abs_quantity"]
+        net_lots = pos_info["net_lots"]
+        reverse_tt = pos_info["required_exit_side"]
+        entry_act = pos_info["template_action"]
 
         # Check if AI parsed explicit price or order_type for this leg in parsed_actions
         matching_parsed = None
         for pa in parsed_actions:
-            pa_sym = clean_symbol(getattr(pa, "underlying", None) or getattr(pa, "instrument_name", None))
             pa_strike = getattr(pa, "strike", None)
-            if (entry_act.strike and pa_strike and abs(entry_act.strike - pa_strike) < 0.01) or \
-               (sym and pa_sym and pa_sym in sym):
+            pa_is_main = getattr(pa, "is_main", None)
+            pa_details = str(getattr(pa, "details", "") or "").lower()
+            pa_inst_name = str(getattr(pa, "instrument_name", "") or "").lower()
+            is_hedge_ref = (pa_is_main is False) or ("hedge" in pa_details) or ("hedge" in pa_inst_name)
+            is_main_ref = (pa_is_main is True) or ("main" in pa_details) or ("main" in pa_inst_name)
+
+            if pa_strike is not None and entry_act.strike is not None:
+                if abs(entry_act.strike - pa_strike) < 0.01:
+                    matching_parsed = pa
+                    break
+            elif is_hedge_ref and not getattr(entry_act, "is_main", True):
+                matching_parsed = pa
+                break
+            elif is_main_ref and getattr(entry_act, "is_main", True):
+                matching_parsed = pa
+                break
+            elif pa_inst_name and sym and pa_inst_name == sym.lower():
                 matching_parsed = pa
                 break
 
@@ -546,7 +624,6 @@ def ensure_square_off_actions(session: Session, trade: Trade, db_message: Messag
         )
         session.add(square_off_action)
         new_square_off_actions.append(square_off_action)
-        already_exited_qty[sym] = already_exited_qty.get(sym, 0) + net_qty
         logger.info(f"Generated square-off action for Trade #{trade.id}: {reverse_tt} {net_qty} ({net_lots}L) x {sym} ({ord_type})")
 
     # Order square-off actions so BUY legs (closing short positions) precede SELL legs (closing long hedge positions)
@@ -581,13 +658,52 @@ def process_trade_actions_and_sizing(
 
     for idx, action_schema in enumerate(parsed_actions):
         u_symbol = clean_symbol(getattr(action_schema, "underlying", None) or (trade.underlying if trade else None))
-        o_type = getattr(action_schema, "option_type", None) or "CE"
+        o_type = getattr(action_schema, "option_type", None)
         strike_val = getattr(action_schema, "strike", None)
         expiry_str = getattr(action_schema, "expiry_info", None)
         is_adj_leg = bool(getattr(action_schema, "is_adjustment", False))
-
-        inst = resolve_nfo_instrument(u_symbol, strike_val, o_type, expiry_str)
         action_type = getattr(action_schema, "action_type", "INFO").upper()
+
+        # Context-aware cross-referencing for exit actions
+        if action_type in ["EXIT", "CLOSE_LEG"] and trade and getattr(trade, "actions", None):
+            is_hedge_ref = (
+                getattr(action_schema, "is_main", None) is False or
+                "hedge" in str(getattr(action_schema, "details", "")).lower() or
+                "hedge" in str(getattr(action_schema, "instrument_name", "")).lower()
+            )
+            # 1. If explicit hedge exit without strike, inherit from active hedge leg
+            if is_hedge_ref and strike_val is None:
+                for pa in trade.actions:
+                    if pa.action_type in ["BUY", "SELL"] and pa.order_status not in ["FAILED", "CANCELLED"]:
+                        if not getattr(pa, "is_main", True) or (pa.transaction_type or pa.action_type).upper() == "BUY":
+                            strike_val = pa.strike
+                            o_type = pa.option_type or o_type
+                            expiry_str = pa.expiry or expiry_str
+                            u_symbol = pa.underlying or u_symbol
+                            break
+            # 2. If strike is specified but option_type is missing/omitted, inherit from trade open leg
+            elif strike_val is not None and not o_type:
+                for pa in trade.actions:
+                    if pa.action_type in ["BUY", "SELL"] and pa.order_status not in ["FAILED", "CANCELLED"]:
+                        if pa.strike and abs(pa.strike - strike_val) < 0.01:
+                            o_type = pa.option_type or o_type
+                            expiry_str = pa.expiry or expiry_str
+                            u_symbol = pa.underlying or u_symbol
+                            break
+            # 3. If strike is missing and single open leg exists, inherit from that open leg
+            elif strike_val is None and not is_hedge_ref:
+                open_acts = [
+                    pa for pa in trade.actions
+                    if pa.action_type in ["BUY", "SELL"] and pa.order_status not in ["FAILED", "CANCELLED"]
+                ]
+                if len(open_acts) == 1:
+                    strike_val = open_acts[0].strike
+                    o_type = open_acts[0].option_type or o_type
+                    expiry_str = open_acts[0].expiry or expiry_str
+                    u_symbol = open_acts[0].underlying or u_symbol
+
+        o_type = o_type or "CE"
+        inst = resolve_nfo_instrument(u_symbol, strike_val, o_type, expiry_str)
 
         resolved_items.append({
             "schema": action_schema,
@@ -715,21 +831,50 @@ def process_trade_actions_and_sizing(
             # Assign quantity based on leg lot size and calculated lots
             resolved_items[i]["quantity"] = calculated_lots * leg_lot_size
 
-    # For exit legs directly in message, try to match existing open legs
+    # For exit legs directly in message, size using net active quantity
     for idx, item in enumerate(resolved_items):
         if item["action_type"] in ["EXIT", "CLOSE_LEG"] and item["quantity"] is None:
             inst = item["inst"]
+            sym = inst.get("tradingsymbol") if inst else None
             lot_sz = inst["lot_size"] if inst else 1
             matched_qty = None
             matched_lots = 1
+            matching_entry_leg = None
+
             if trade and getattr(trade, "actions", None):
+                matching_entry_qty = 0
+                matching_exit_qty = 0
+                entry_lots_total = 0
+
                 for prior_act in trade.actions:
-                    if prior_act.action_type in ["BUY", "SELL"] and prior_act.quantity:
-                        if (prior_act.tradingsymbol and inst and prior_act.tradingsymbol == inst.get("tradingsymbol")) or \
-                           (prior_act.strike and item["strike"] and abs(prior_act.strike - item["strike"]) < 0.01):
-                            matched_qty = prior_act.quantity
-                            matched_lots = prior_act.lots or 1
-                            break
+                    if prior_act.order_status in ["FAILED", "CANCELLED"]:
+                        continue
+                    is_match = False
+                    if sym and prior_act.tradingsymbol and prior_act.tradingsymbol == sym:
+                        is_match = True
+                    elif prior_act.strike and item["strike"] and abs(prior_act.strike - item["strike"]) < 0.01:
+                        is_match = True
+
+                    if is_match:
+                        if prior_act.action_type in ["BUY", "SELL"]:
+                            matching_entry_qty += (prior_act.quantity or 0)
+                            entry_lots_total += (prior_act.lots or 1)
+                            if not matching_entry_leg:
+                                matching_entry_leg = prior_act
+                        elif prior_act.action_type in ["EXIT", "CLOSE_LEG"]:
+                            matching_exit_qty += (prior_act.quantity or 0)
+
+                net_open = matching_entry_qty - matching_exit_qty
+                if net_open > 0:
+                    matched_qty = net_open
+                    matched_lots = max(1, int(round(net_open / lot_sz))) if lot_sz > 0 else entry_lots_total
+                elif matching_entry_qty > 0:
+                    matched_qty = matching_entry_qty
+                    matched_lots = entry_lots_total
+
+                if matching_entry_leg:
+                    item["is_main"] = getattr(matching_entry_leg, "is_main", True)
+
             item["lots"] = matched_lots
             item["quantity"] = matched_qty or (matched_lots * lot_sz)
 
@@ -753,13 +898,13 @@ def process_trade_actions_and_sizing(
                 matching_entry = None
                 if trade and getattr(trade, "actions", None):
                     for pa in trade.actions:
-                        if pa.action_type in ["BUY", "SELL"]:
+                        if pa.action_type in ["BUY", "SELL"] and pa.order_status not in ["FAILED", "CANCELLED"]:
                             if (inst and pa.tradingsymbol == inst.get("tradingsymbol")) or \
-                               (strike_val and pa.strike and abs(pa.strike - strike_val) < 0.01):
+                               (item["strike"] and pa.strike and abs(pa.strike - item["strike"]) < 0.01):
                                  matching_entry = pa
                                  break
                 if matching_entry:
-                    trans_type = "BUY" if matching_entry.transaction_type == "SELL" else "SELL"
+                    trans_type = "BUY" if (matching_entry.transaction_type or matching_entry.action_type).upper() == "SELL" else "SELL"
                 else:
                     # In credit spreads / short fut spreads, main is short (exit BUY), hedge is long (exit SELL)
                     if item["is_main"]:
@@ -1151,6 +1296,16 @@ def setup_telegram_event_handlers():
                     icon = "✅" if r["success"] else "❌"
                     status_text = f"Order ID: <code>{r['order_id']}</code>" if r["success"] else f"Error: {r['message']}"
                     lines.append(f"{icon} <code>{r['tradingsymbol']}</code> -> {status_text}")
+
+                if trade.status == "CLOSED":
+                    trade_symbols = list({a.tradingsymbol for a in trade.actions if a.tradingsymbol})
+                    if trade_symbols:
+                        verif = verify_zerodha_positions_zero(trade_symbols)
+                        if verif["verified"]:
+                            if verif["all_zero"]:
+                                lines.append("\n✅ <b>Zerodha Position Book:</b> Confirmed all positions FLAT (0).")
+                            else:
+                                lines.append(f"\n⚠️ <b>Zerodha Position Alert:</b> {verif['message']}")
 
                 res_msg = "\n".join(lines)
                 await event.respond(res_msg, parse_mode='html')
@@ -1607,6 +1762,24 @@ async def process_single_message(session: Session, db_message: Message, actions_
         if failed_orders:
             ctx.set_warning(f"{len(failed_orders)} orders failed: {', '.join(r.get('message', '') for r in failed_orders)}")
         ctx.set_details({"results": exec_results, "auto_mode": True})
+
+    # 6b. Live Position Book Closure Verification (if trade is closed or exiting)
+    if trade and (trade.status == "CLOSED" or analysis.trade_status_update == "CLOSED" or any(a.action_type in ["EXIT", "CLOSE_LEG"] for a in analysis.actions)):
+        with StageContext("TRADE_POSITION_CLOSURE_VERIFICATION", message_id=db_message.id, telegram_message_id=db_message.telegram_message_id, trade_id=trade.id, revision=rev, session=session) as ctx:
+            trade_symbols = list({a.tradingsymbol for a in trade.actions if a.tradingsymbol})
+            if trade_symbols:
+                verif = verify_zerodha_positions_zero(trade_symbols)
+                if verif["verified"]:
+                    if verif["all_zero"]:
+                        logger.info(f"Trade #{trade.id} position closure verified: All {len(trade_symbols)} Zerodha positions are zero ({', '.join(trade_symbols)}).")
+                        ctx.set_details(verif)
+                    else:
+                        logger.warning(f"Trade #{trade.id} closure verification ALERT: Non-zero positions remain on Zerodha: {verif['open_positions']}")
+                        ctx.set_warning(verif["message"])
+                        ctx.set_details(verif)
+                else:
+                    ctx.set_warning(verif["message"])
+                    ctx.set_details(verif)
 
     # 7. Action Notification to Telegram
     if actions_entity and db_actions:

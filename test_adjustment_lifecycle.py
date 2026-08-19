@@ -15,8 +15,10 @@ from worker import (
     evaluate_and_deduplicate_adjustments,
     process_trade_actions_and_sizing,
     ensure_square_off_actions,
+    compute_trade_net_positions,
     process_single_message
 )
+from zerodha_client import get_zerodha_net_positions, verify_zerodha_positions_zero
 from gemini_client import TradeAnalysisSchema, ActionSchema
 
 
@@ -475,6 +477,258 @@ class TestTradeAdjustmentLifecycle(unittest.TestCase):
         self.assertEqual(actions[0].lots, 1)  # Capped at 1 lot, not sized to 4 lots from 10L budget
         self.assertTrue(actions[0].is_adjustment)
         self.assertEqual(actions[0].adjustment_number, 1)
+
+    def test_compute_trade_net_positions_with_averaging_and_hedging(self):
+        """
+        Verify that compute_trade_net_positions aggregates entry quantities and calculates
+        net position balances, sides, required reverse exit sides, and lots accurately.
+        """
+        msg = Message(id=10, text="Spread Entry + Averaging", date=datetime.utcnow())
+        self.session.add(msg)
+        self.session.commit()
+
+        trade = Trade(id=88, underlying="NIFTY", status="OPEN")
+        self.session.add(trade)
+        self.session.commit()
+
+        # Leg 1: Short 24600 PE (1 initial lot + 1 averaged lot = 130 qty)
+        act1 = Action(trade_id=trade.id, message_id=msg.id, action_type="SELL", transaction_type="SELL", is_main=True, tradingsymbol="NIFTY26AUG24600PE", strike=24600.0, option_type="PE", quantity=65, lots=1, order_status="PLACED")
+        act2 = Action(trade_id=trade.id, message_id=msg.id, action_type="SELL", transaction_type="SELL", is_main=True, is_adjustment=True, tradingsymbol="NIFTY26AUG24600PE", strike=24600.0, option_type="PE", quantity=65, lots=1, order_status="PLACED")
+        
+        # Leg 2: Long 24300 PE (1 initial lot + 1 averaged lot = 130 qty)
+        act3 = Action(trade_id=trade.id, message_id=msg.id, action_type="BUY", transaction_type="BUY", is_main=False, tradingsymbol="NIFTY26AUG24300PE", strike=24300.0, option_type="PE", quantity=65, lots=1, order_status="PLACED")
+        act4 = Action(trade_id=trade.id, message_id=msg.id, action_type="BUY", transaction_type="BUY", is_main=False, is_adjustment=True, tradingsymbol="NIFTY26AUG24300PE", strike=24300.0, option_type="PE", quantity=65, lots=1, order_status="PLACED")
+
+        self.session.add_all([act1, act2, act3, act4])
+        self.session.commit()
+
+        net_pos = compute_trade_net_positions(self.session, trade.id)
+
+        self.assertEqual(len(net_pos), 2)
+        # Short leg: net -130, side SHORT, required exit side BUY, 2 lots
+        self.assertEqual(net_pos["NIFTY26AUG24600PE"]["net_quantity"], -130)
+        self.assertEqual(net_pos["NIFTY26AUG24600PE"]["abs_quantity"], 130)
+        self.assertEqual(net_pos["NIFTY26AUG24600PE"]["position_side"], "SHORT")
+        self.assertEqual(net_pos["NIFTY26AUG24600PE"]["required_exit_side"], "BUY")
+        self.assertEqual(net_pos["NIFTY26AUG24600PE"]["net_lots"], 2)
+
+        # Long leg: net +130, side LONG, required exit side SELL, 2 lots
+        self.assertEqual(net_pos["NIFTY26AUG24300PE"]["net_quantity"], 130)
+        self.assertEqual(net_pos["NIFTY26AUG24300PE"]["abs_quantity"], 130)
+        self.assertEqual(net_pos["NIFTY26AUG24300PE"]["position_side"], "LONG")
+        self.assertEqual(net_pos["NIFTY26AUG24300PE"]["required_exit_side"], "SELL")
+        self.assertEqual(net_pos["NIFTY26AUG24300PE"]["net_lots"], 2)
+
+    def test_compute_trade_net_positions_ignores_failed_or_cancelled_actions(self):
+        """
+        Verify that FAILED or CANCELLED actions are not counted when computing net positions.
+        """
+        msg = Message(id=11, text="Test Failed Actions", date=datetime.utcnow())
+        self.session.add(msg)
+        self.session.commit()
+
+        trade = Trade(id=89, underlying="NIFTY", status="OPEN")
+        self.session.add(trade)
+        self.session.commit()
+
+        # Placed entry: 65 qty
+        act1 = Action(trade_id=trade.id, message_id=msg.id, action_type="SELL", transaction_type="SELL", tradingsymbol="NIFTY26AUG24600PE", strike=24600.0, quantity=65, lots=1, order_status="PLACED")
+        # Failed averaging entry: 65 qty (should be ignored)
+        act2 = Action(trade_id=trade.id, message_id=msg.id, action_type="SELL", transaction_type="SELL", tradingsymbol="NIFTY26AUG24600PE", strike=24600.0, quantity=65, lots=1, order_status="FAILED")
+        # Cancelled entry: 65 qty (should be ignored)
+        act3 = Action(trade_id=trade.id, message_id=msg.id, action_type="SELL", transaction_type="SELL", tradingsymbol="NIFTY26AUG24600PE", strike=24600.0, quantity=65, lots=1, order_status="CANCELLED")
+
+        self.session.add_all([act1, act2, act3])
+        self.session.commit()
+
+        net_pos = compute_trade_net_positions(self.session, trade.id)
+        self.assertEqual(net_pos["NIFTY26AUG24600PE"]["net_quantity"], -65)
+        self.assertEqual(net_pos["NIFTY26AUG24600PE"]["abs_quantity"], 65)
+        self.assertEqual(net_pos["NIFTY26AUG24600PE"]["net_lots"], 1)
+
+    def test_exit_message_with_price_for_main_leg_only_sizes_main_and_squares_off_hedge(self):
+        """
+        Verify that when an exit message mentions price only for the main leg (e.g. "Close 24600 PE at 90"):
+        1. The main leg exit action is sized to the FULL NET ACTIVE QUANTITY (130 qty = 2 lots) with LIMIT 90.
+        2. The hedge leg (24300 PE) is automatically squared off for 130 qty (2 lots) with MARKET order.
+        3. No duplicate exit orders are created.
+        """
+        msg_entry = Message(id=20, text="Initial + Avg Entries", date=datetime.utcnow())
+        self.session.add(msg_entry)
+        self.session.commit()
+
+        trade = Trade(id=90, underlying="NIFTY", structure_type="NIFTY PE SPREAD", status="OPEN", adjustment_count=1)
+        self.session.add(trade)
+        self.session.commit()
+
+        # Entries: 2 lots of 24600 PE SELL (130 qty) and 2 lots of 24300 PE BUY (130 qty)
+        entry_main_1 = Action(trade_id=trade.id, message_id=msg_entry.id, action_type="SELL", transaction_type="SELL", is_main=True, tradingsymbol="NIFTY2681824600PE", strike=24600.0, option_type="PE", quantity=65, lots=1, order_status="PLACED")
+        entry_main_2 = Action(trade_id=trade.id, message_id=msg_entry.id, action_type="SELL", transaction_type="SELL", is_main=True, is_adjustment=True, tradingsymbol="NIFTY2681824600PE", strike=24600.0, option_type="PE", quantity=65, lots=1, order_status="PLACED")
+        entry_hedge_1 = Action(trade_id=trade.id, message_id=msg_entry.id, action_type="BUY", transaction_type="BUY", is_main=False, tradingsymbol="NIFTY2681824300PE", strike=24300.0, option_type="PE", quantity=65, lots=1, order_status="PLACED")
+        entry_hedge_2 = Action(trade_id=trade.id, message_id=msg_entry.id, action_type="BUY", transaction_type="BUY", is_main=False, is_adjustment=True, tradingsymbol="NIFTY2681824300PE", strike=24300.0, option_type="PE", quantity=65, lots=1, order_status="PLACED")
+        self.session.add_all([entry_main_1, entry_main_2, entry_hedge_1, entry_hedge_2])
+        self.session.commit()
+
+        # Exit message arrives with price for main leg only: "Close 24600 PE at 90"
+        exit_msg = Message(id=21, text="Close 24600 PE at 90", date=datetime.utcnow())
+        self.session.add(exit_msg)
+        self.session.commit()
+
+        # AI parsed 1 action for the main leg
+        parsed_actions = [
+            ActionSchema(action_type="EXIT", option_type="PE", strike=24600.0, price="90.0", is_limit=True, underlying="NIFTY")
+        ]
+
+        # Step 4: Sizing explicit actions
+        db_actions = process_trade_actions_and_sizing(trade, exit_msg.id, parsed_actions)
+        for act in db_actions:
+            self.session.add(act)
+        self.session.commit()
+
+        # Main leg exit MUST be sized for all 130 qty (2 lots)
+        self.assertEqual(len(db_actions), 1)
+        self.assertEqual(db_actions[0].tradingsymbol, "NIFTY2681824600PE")
+        self.assertEqual(db_actions[0].quantity, 130)
+        self.assertEqual(db_actions[0].lots, 2)
+        self.assertEqual(db_actions[0].order_type, "LIMIT")
+        self.assertEqual(db_actions[0].transaction_type, "BUY")
+        self.assertEqual(db_actions[0].price, "90.0")
+
+        # Step 5: Square-off generation
+        sq_actions = ensure_square_off_actions(self.session, trade, exit_msg, parsed_actions)
+        
+        # Square-off generator MUST generate exit for the hedge leg (130 qty SELL MARKET) and 0 duplicates for main leg
+        self.assertEqual(len(sq_actions), 1)
+        self.assertEqual(sq_actions[0].tradingsymbol, "NIFTY2681824300PE")
+        self.assertEqual(sq_actions[0].quantity, 130)
+        self.assertEqual(sq_actions[0].lots, 2)
+        self.assertEqual(sq_actions[0].transaction_type, "SELL")
+        self.assertEqual(sq_actions[0].order_type, "MARKET")
+
+    def test_exit_message_with_explicit_hedge_closure_resolves_and_sizes_hedge_leg(self):
+        """
+        Verify that when an exit message says "Close 24600 PE at 90, close hedge immediately":
+        Both legs are properly resolved, sized to full 130 qty (2 lots), and no redundant square-offs are generated.
+        """
+        msg_entry = Message(id=30, text="Initial + Avg Entries", date=datetime.utcnow())
+        self.session.add(msg_entry)
+        self.session.commit()
+
+        trade = Trade(id=91, underlying="NIFTY", structure_type="NIFTY PE SPREAD", status="OPEN", adjustment_count=1)
+        self.session.add(trade)
+        self.session.commit()
+
+        entry_main_1 = Action(trade_id=trade.id, message_id=msg_entry.id, action_type="SELL", transaction_type="SELL", is_main=True, tradingsymbol="NIFTY2681824600PE", strike=24600.0, option_type="PE", quantity=65, lots=1, order_status="PLACED")
+        entry_main_2 = Action(trade_id=trade.id, message_id=msg_entry.id, action_type="SELL", transaction_type="SELL", is_main=True, is_adjustment=True, tradingsymbol="NIFTY2681824600PE", strike=24600.0, option_type="PE", quantity=65, lots=1, order_status="PLACED")
+        entry_hedge_1 = Action(trade_id=trade.id, message_id=msg_entry.id, action_type="BUY", transaction_type="BUY", is_main=False, tradingsymbol="NIFTY2681824300PE", strike=24300.0, option_type="PE", quantity=65, lots=1, order_status="PLACED")
+        entry_hedge_2 = Action(trade_id=trade.id, message_id=msg_entry.id, action_type="BUY", transaction_type="BUY", is_main=False, is_adjustment=True, tradingsymbol="NIFTY2681824300PE", strike=24300.0, option_type="PE", quantity=65, lots=1, order_status="PLACED")
+        self.session.add_all([entry_main_1, entry_main_2, entry_hedge_1, entry_hedge_2])
+        self.session.commit()
+
+        exit_msg = Message(id=31, text="Close 24600 PE at 90, close hedge immediately", date=datetime.utcnow())
+        self.session.add(exit_msg)
+        self.session.commit()
+
+        parsed_actions = [
+            ActionSchema(action_type="EXIT", option_type="PE", strike=24600.0, price="90.0", is_limit=True, underlying="NIFTY", is_main=True),
+            ActionSchema(action_type="EXIT", details="close hedge immediately", is_main=False, underlying="NIFTY")
+        ]
+
+        db_actions = process_trade_actions_and_sizing(trade, exit_msg.id, parsed_actions)
+        for act in db_actions:
+            self.session.add(act)
+        self.session.commit()
+
+        self.assertEqual(len(db_actions), 2)
+        # Order execution ordering: BUY (closing short) first, SELL (closing hedge) second
+        self.assertEqual(db_actions[0].tradingsymbol, "NIFTY2681824600PE")
+        self.assertEqual(db_actions[0].transaction_type, "BUY")
+        self.assertEqual(db_actions[0].quantity, 130)
+        self.assertEqual(db_actions[0].lots, 2)
+        self.assertEqual(db_actions[0].price, "90.0")
+
+        self.assertEqual(db_actions[1].tradingsymbol, "NIFTY2681824300PE")
+        self.assertEqual(db_actions[1].transaction_type, "SELL")
+        self.assertEqual(db_actions[1].quantity, 130)
+        self.assertEqual(db_actions[1].lots, 2)
+        self.assertEqual(db_actions[1].order_type, "MARKET")
+
+        # Step 5: Square off should find 0 remaining open positions
+        sq_actions = ensure_square_off_actions(self.session, trade, exit_msg, parsed_actions)
+        self.assertEqual(len(sq_actions), 0)
+
+    def test_exit_message_with_omitted_option_type_inherits_from_open_leg(self):
+        """
+        Verify that when an exit message omits option type (e.g. "Close 24600 at 90"),
+        it inherits "PE" from the active open leg rather than defaulting to "CE".
+        """
+        msg_entry = Message(id=40, text="Entry", date=datetime.utcnow())
+        self.session.add(msg_entry)
+        self.session.commit()
+
+        trade = Trade(id=92, underlying="NIFTY", status="OPEN")
+        self.session.add(trade)
+        self.session.commit()
+
+        entry_act = Action(trade_id=trade.id, message_id=msg_entry.id, action_type="SELL", transaction_type="SELL", is_main=True, tradingsymbol="NIFTY2681824600PE", strike=24600.0, option_type="PE", quantity=65, lots=1, order_status="PLACED")
+        self.session.add(entry_act)
+        self.session.commit()
+
+        exit_msg = Message(id=41, text="Close 24600 at 90", date=datetime.utcnow())
+        self.session.add(exit_msg)
+        self.session.commit()
+
+        # Option type omitted (None)
+        parsed_actions = [
+            ActionSchema(action_type="EXIT", option_type=None, strike=24600.0, price="90.0", is_limit=True, underlying="NIFTY")
+        ]
+
+        db_actions = process_trade_actions_and_sizing(trade, exit_msg.id, parsed_actions)
+        self.assertEqual(len(db_actions), 1)
+        self.assertEqual(db_actions[0].option_type, "PE")
+        self.assertEqual(db_actions[0].tradingsymbol, "NIFTY2681824600PE")
+        self.assertEqual(db_actions[0].transaction_type, "BUY")
+
+    @patch("zerodha_client.get_zerodha_client")
+    def test_zerodha_live_position_verification_zero_and_nonzero(self, mock_get_kite):
+        """
+        Verify that verify_zerodha_positions_zero confirms zero net positions and alerts on non-zero positions.
+        """
+        mock_kite = MagicMock()
+        mock_get_kite.return_value = mock_kite
+
+        # Case 1: All positions zero (flat)
+        mock_kite.positions.return_value = {
+            "net": [
+                {"tradingsymbol": "NIFTY2681824600PE", "quantity": 0},
+                {"tradingsymbol": "NIFTY2681824300PE", "quantity": 0}
+            ]
+        }
+        res_zero = verify_zerodha_positions_zero(["NIFTY2681824600PE", "NIFTY2681824300PE"])
+        self.assertTrue(res_zero["all_zero"])
+        self.assertTrue(res_zero["verified"])
+        self.assertEqual(len(res_zero["open_positions"]), 0)
+        self.assertIn("confirmed ZERO", res_zero["message"])
+
+        # Case 2: Non-zero positions remain
+        mock_kite.positions.return_value = {
+            "net": [
+                {"tradingsymbol": "NIFTY2681824600PE", "quantity": -65},
+                {"tradingsymbol": "NIFTY2681824300PE", "quantity": 0}
+            ]
+        }
+        res_nonzero = verify_zerodha_positions_zero(["NIFTY2681824600PE", "NIFTY2681824300PE"])
+        self.assertFalse(res_nonzero["all_zero"])
+        self.assertTrue(res_nonzero["verified"])
+        self.assertEqual(res_nonzero["open_positions"], {"NIFTY2681824600PE": -65})
+        self.assertIn("WARNING: Non-zero positions remain", res_nonzero["message"])
+
+        # Case 3: Kite positions API exception
+        mock_kite.positions.side_effect = Exception("Zerodha Network Error")
+        res_err = verify_zerodha_positions_zero(["NIFTY2681824600PE"])
+        self.assertFalse(res_err["all_zero"])
+        self.assertFalse(res_err["verified"])
+        self.assertIn("Could not verify Zerodha live positions", res_err["message"])
 
 
 if __name__ == "__main__":

@@ -538,6 +538,76 @@ class TestSpreadExecutionOrdering(unittest.TestCase):
         finally:
             os.environ["AUTO_PLACE_ORDERS"] = "false"
 
+    @patch("worker.client.send_message")
+    @patch("worker.analyze_message_with_ai")
+    @patch("worker.verify_zerodha_positions_zero")
+    def test_trade_position_closure_verification_stage_recorded(self, mock_verif_zero, mock_ai, mock_send):
+        """
+        Verify that when a trade is closed by an exit alert,
+        the TRADE_POSITION_CLOSURE_VERIFICATION stage trace is recorded.
+        """
+        import asyncio
+        from gemini_client import TradeAnalysisSchema
+
+        # Existing open trade in database with 1 leg
+        trade = Trade(id=301, underlying="NIFTY", status="OPEN", structure_type="NIFTY PE SPREAD")
+        self.session.add(trade)
+        self.session.commit()
+
+        entry_act = Action(
+            trade_id=trade.id,
+            message_id=self.msg.id,
+            action_type="SELL",
+            transaction_type="SELL",
+            is_main=True,
+            tradingsymbol="NIFTY2681824600PE",
+            quantity=65,
+            lots=1,
+            order_status="PLACED"
+        )
+        self.session.add(entry_act)
+        self.session.commit()
+
+        mock_verif_zero.return_value = {
+            "all_zero": True,
+            "open_positions": {},
+            "positions": {"NIFTY2681824600PE": 0},
+            "verified": True,
+            "message": "All 1 associated position(s) confirmed ZERO on Zerodha."
+        }
+
+        mock_ai.return_value = TradeAnalysisSchema(
+            is_valid_trade_msg=True,
+            underlying="NIFTY",
+            trade_status_update="CLOSED",
+            actions=[]
+        )
+        mock_send.return_value = MagicMock()
+
+        exit_msg = Message(
+            telegram_message_id=7001,
+            channel_id="test_channel",
+            text="SL hit close full position",
+            date=datetime.utcnow(),
+            processed=False,
+            analysed_by_ai=False,
+            revision=0
+        )
+        self.session.add(exit_msg)
+        self.session.commit()
+
+        asyncio.run(process_single_message(self.session, exit_msg, actions_entity=None))
+
+        # Check TRADE_POSITION_CLOSURE_VERIFICATION stage trace
+        trace = self.session.query(MessageStageTrace).filter(
+            MessageStageTrace.message_id == exit_msg.id,
+            MessageStageTrace.stage == "TRADE_POSITION_CLOSURE_VERIFICATION"
+        ).first()
+
+        self.assertIsNotNone(trace)
+        self.assertEqual(trace.status, "SUCCESS")
+        self.assertIn("all_zero", trace.details or "")
+
 
 if __name__ == "__main__":
     unittest.main()

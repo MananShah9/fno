@@ -266,6 +266,108 @@ def check_existing_zerodha_order_or_position(
     return {"duplicate": False, "reason": None, "order_id": None, "message": ""}
 
 
+def get_zerodha_net_positions(tradingsymbols: list = None) -> dict:
+    """
+    Queries Zerodha Kite Connect live position book and returns a dictionary of
+    tradingsymbol -> net_quantity. If tradingsymbols list is provided, filters for those symbols
+    and guarantees all requested symbols exist in the returned dictionary (defaulting to 0).
+    Returns dict:
+        {
+            "success": bool,
+            "positions": {tradingsymbol: int_net_qty, ...},
+            "raw_positions": list,
+            "error": str | None
+        }
+    """
+    try:
+        kite = get_zerodha_client()
+        pos_resp = kite.positions() or {}
+        net_positions = pos_resp.get("net", []) or []
+
+        pos_map = {}
+        target_set = {str(s).strip().upper() for s in tradingsymbols} if tradingsymbols else None
+
+        for p in net_positions:
+            sym = str(p.get("tradingsymbol", "")).strip().upper()
+            if not sym:
+                continue
+            qty = int(p.get("quantity", 0) or 0)
+            if target_set is None or sym in target_set:
+                pos_map[sym] = qty
+
+        # If target symbols were requested, ensure all requested symbols are present (0 if not in Kite net positions)
+        if target_set:
+            for s in target_set:
+                if s not in pos_map:
+                    pos_map[s] = 0
+
+        return {
+            "success": True,
+            "positions": pos_map,
+            "raw_positions": net_positions,
+            "error": None
+        }
+    except Exception as e:
+        logger.warning(f"Failed to fetch Zerodha net positions: {e}")
+        return {
+            "success": False,
+            "positions": {},
+            "raw_positions": [],
+            "error": str(e)
+        }
+
+
+def verify_zerodha_positions_zero(tradingsymbols: list) -> dict:
+    """
+    Verifies that the net positions in Zerodha for all provided trading symbols are exactly 0.
+    Returns dict:
+        {
+            "all_zero": bool,
+            "open_positions": {tradingsymbol: net_qty},
+            "positions": {tradingsymbol: net_qty},
+            "verified": bool,
+            "message": str
+        }
+    """
+    if not tradingsymbols:
+        return {
+            "all_zero": True,
+            "open_positions": {},
+            "positions": {},
+            "verified": True,
+            "message": "No trading symbols provided for position verification."
+        }
+
+    clean_symbols = [str(s).strip().upper() for s in tradingsymbols if s]
+    res = get_zerodha_net_positions(clean_symbols)
+    if not res["success"]:
+        return {
+            "all_zero": False,
+            "open_positions": {},
+            "positions": {},
+            "verified": False,
+            "message": f"Could not verify Zerodha live positions: {res['error']}"
+        }
+
+    positions = res["positions"]
+    open_positions = {sym: qty for sym, qty in positions.items() if qty != 0}
+    all_zero = len(open_positions) == 0
+
+    if all_zero:
+        msg = f"All {len(clean_symbols)} associated position(s) confirmed ZERO on Zerodha."
+    else:
+        open_str = ", ".join(f"{sym}: {qty}" for sym, qty in open_positions.items())
+        msg = f"WARNING: Non-zero positions remain active on Zerodha: {open_str}"
+
+    return {
+        "all_zero": all_zero,
+        "open_positions": open_positions,
+        "positions": positions,
+        "verified": True,
+        "message": msg
+    }
+
+
 def get_zerodha_order_status(order_id: str) -> dict:
     """
     Fetches the latest execution status for an order_id from Zerodha Kite Connect.
