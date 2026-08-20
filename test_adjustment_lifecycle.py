@@ -585,6 +585,8 @@ class TestTradeAdjustmentLifecycle(unittest.TestCase):
         for act in db_actions:
             self.session.add(act)
         self.session.commit()
+        self.session.refresh(trade)
+        self.session.refresh(exit_msg)
 
         # Main leg exit MUST be sized for all 130 qty (2 lots)
         self.assertEqual(len(db_actions), 1)
@@ -639,6 +641,8 @@ class TestTradeAdjustmentLifecycle(unittest.TestCase):
         for act in db_actions:
             self.session.add(act)
         self.session.commit()
+        self.session.refresh(trade)
+        self.session.refresh(exit_msg)
 
         self.assertEqual(len(db_actions), 2)
         # Order execution ordering: BUY (closing short) first, SELL (closing hedge) second
@@ -666,18 +670,22 @@ class TestTradeAdjustmentLifecycle(unittest.TestCase):
         msg_entry = Message(id=40, text="Entry", date=datetime.utcnow())
         self.session.add(msg_entry)
         self.session.commit()
+        self.session.refresh(msg_entry)
 
         trade = Trade(id=92, underlying="NIFTY", status="OPEN")
         self.session.add(trade)
         self.session.commit()
+        self.session.refresh(trade)
 
         entry_act = Action(trade_id=trade.id, message_id=msg_entry.id, action_type="SELL", transaction_type="SELL", is_main=True, tradingsymbol="NIFTY2681824600PE", strike=24600.0, option_type="PE", quantity=65, lots=1, order_status="PLACED")
         self.session.add(entry_act)
         self.session.commit()
+        self.session.refresh(entry_act)
 
         exit_msg = Message(id=41, text="Close 24600 at 90", date=datetime.utcnow())
         self.session.add(exit_msg)
         self.session.commit()
+        self.session.refresh(exit_msg)
 
         # Option type omitted (None)
         parsed_actions = [

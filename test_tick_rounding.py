@@ -12,7 +12,10 @@ class TestTickRounding(unittest.TestCase):
         self.session = get_db()
 
     def tearDown(self):
-        self.session.rollback()
+        self.session.query(Action).delete()
+        self.session.query(Message).delete()
+        self.session.query(Trade).delete()
+        self.session.commit()
         self.session.close()
 
     def test_round_to_tick_buy_and_sell_directions(self):
@@ -250,7 +253,9 @@ class TestTickRounding(unittest.TestCase):
             exchange="NFO",
             order_type="LIMIT",
             product="NRML",
-            price=1.50
+            price=1.50,
+            freeze_limit=1800,
+            lot_size=65
         )
 
 

@@ -370,6 +370,7 @@ class TestSpotStopLossMonitoring(unittest.TestCase):
         msg = Message(telegram_message_id=8002, text="Initial Trade Message", processed=True, analysed_by_ai=True)
         self.session.add(msg)
         self.session.commit()
+        self.session.refresh(msg)
 
         # Short main leg (65 qty)
         act_short = Action(
@@ -469,6 +470,7 @@ class TestSpotStopLossMonitoring(unittest.TestCase):
         msg = Message(telegram_message_id=8003, text="Tata Steel Trade Setup", processed=True, analysed_by_ai=True)
         self.session.add(msg)
         self.session.commit()
+        self.session.refresh(msg)
 
         act = Action(
             trade_id=trade.id,

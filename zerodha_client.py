@@ -9,7 +9,10 @@ from typing import Optional, Dict, Any, List, Union
 import requests
 import pyotp
 from kiteconnect import KiteConnect
-from instruments_manager import get_spot_instrument_key, is_index_symbol, round_to_tick, parse_price_value
+from instruments_manager import (
+    get_spot_instrument_key, is_index_symbol, round_to_tick, parse_price_value,
+    get_freeze_quantity, slice_order_quantity
+)
 
 logger = logging.getLogger("zerodha")
 
@@ -611,6 +614,69 @@ def get_zerodha_order_status(order_id: str) -> dict:
         }
 
     clean_order_id = str(order_id).strip()
+
+    # Handle comma-separated multiple order IDs from sliced orders
+    if "," in clean_order_id:
+        sub_ids = [oid.strip() for oid in clean_order_id.split(",") if oid.strip()]
+        if not sub_ids:
+            return {
+                "success": False, "confirmed": False, "status": "UNKNOWN",
+                "raw_status": "UNKNOWN", "status_message": "Missing order_id",
+                "filled_quantity": 0, "pending_quantity": 0, "average_price": 0.0
+            }
+        sub_statuses = [get_zerodha_order_status(sid) for sid in sub_ids]
+
+        all_confirmed = all(s.get("confirmed", False) for s in sub_statuses)
+        all_success = all(s.get("success", False) for s in sub_statuses)
+        any_failed = any(not s.get("success", False) or s.get("status") in ["REJECTED", "CANCELLED", "FAILED"] for s in sub_statuses)
+
+        total_filled = sum(int(s.get("filled_quantity", 0) or 0) for s in sub_statuses)
+        total_pending = sum(int(s.get("pending_quantity", 0) or 0) for s in sub_statuses)
+        total_executed_val = sum(float(s.get("filled_quantity", 0) or 0) * float(s.get("average_price", 0.0) or 0.0) for s in sub_statuses)
+        avg_price = total_executed_val / total_filled if total_filled > 0 else 0.0
+
+        sub_status_names = [s.get("status") for s in sub_statuses]
+        if all(st == "FILLED" for st in sub_status_names):
+            combined_status = "FILLED"
+            raw_status = "COMPLETE"
+        elif all(st in ["REJECTED", "FAILED"] for st in sub_status_names):
+            combined_status = "REJECTED"
+            raw_status = "REJECTED"
+        elif all(st == "CANCELLED" for st in sub_status_names):
+            combined_status = "CANCELLED"
+            raw_status = "CANCELLED"
+        elif any(st == "FILLED" for st in sub_status_names) or total_filled > 0:
+            combined_status = "PARTIAL_FILL"
+            raw_status = "PARTIAL"
+        elif any(st == "OPEN_LIMIT" for st in sub_status_names):
+            combined_status = "OPEN_LIMIT"
+            raw_status = "OPEN"
+        elif any(st == "TRIGGER_PENDING" for st in sub_status_names):
+            combined_status = "TRIGGER_PENDING"
+            raw_status = "TRIGGER PENDING"
+        else:
+            combined_status = sub_status_names[0] if sub_status_names else "SUBMITTED"
+            raw_status = "SUBMITTED"
+
+        status_msgs = [s.get("status_message") for s in sub_statuses if s.get("status_message")]
+        combined_msg = " | ".join(status_msgs) if status_msgs else f"Aggregated status for {len(sub_ids)} sliced orders"
+
+        err_cat = next((s.get("error_category") for s in sub_statuses if s.get("error_category")), None)
+        err_cls = next((s.get("error_class") for s in sub_statuses if s.get("error_class")), None)
+
+        return {
+            "success": all_success if not any_failed else (total_filled > 0),
+            "confirmed": all_confirmed,
+            "status": combined_status,
+            "raw_status": raw_status,
+            "status_message": combined_msg,
+            "error_category": err_cat,
+            "error_class": err_cls,
+            "filled_quantity": total_filled,
+            "pending_quantity": total_pending,
+            "average_price": avg_price
+        }
+
     confirmed_statuses = {
         "COMPLETE", "OPEN", "TRIGGER PENDING",
         "AMO REQ RECEIVED", "PUT ORDER REQ RECEIVED",
@@ -784,8 +850,21 @@ def cancel_zerodha_order(order_id: str, variety: str = "regular") -> dict:
             "error_class": None
         }
     try:
-        kite = get_zerodha_client()
         clean_order_id = str(order_id).strip()
+        if "," in clean_order_id:
+            sub_ids = [oid.strip() for oid in clean_order_id.split(",") if oid.strip()]
+            results = [cancel_zerodha_order(sid, variety=variety) for sid in sub_ids]
+            all_ok = all(r.get("success", False) for r in results)
+            first_err = next((r for r in results if not r.get("success")), None)
+            return {
+                "success": all_ok,
+                "order_id": clean_order_id,
+                "message": f"Cancelled {sum(1 for r in results if r.get('success'))}/{len(sub_ids)} orders: {', '.join(sub_ids)}.",
+                "error_category": first_err.get("error_category") if first_err else None,
+                "error_class": first_err.get("error_class") if first_err else None
+            }
+
+        kite = get_zerodha_client()
         v = kite.VARIETY_REGULAR if str(variety).lower() == "regular" else kite.VARIETY_AMO
         resp = kite.cancel_order(variety=v, order_id=clean_order_id)
         logger.info(f"Cancelled Zerodha order {clean_order_id}: {resp}")
@@ -812,6 +891,7 @@ def reconcile_zerodha_orders(order_ids: Optional[List[str]] = None) -> Dict[str,
     """
     Fetches the latest execution status for a list of order IDs from Zerodha Kite Connect.
     Queries bulk kite.orders() for efficiency (1 API call).
+    Handles individual order IDs as well as comma-separated composite IDs from sliced orders.
     Returns dict mapping order_id -> {
         "order_id": str,
         "status": mapped_status,
@@ -825,7 +905,21 @@ def reconcile_zerodha_orders(order_ids: Optional[List[str]] = None) -> Dict[str,
     }
     """
     results = {}
-    target_ids = {str(oid).strip() for oid in order_ids} if order_ids else None
+    target_ids = None
+    composite_map = {}  # maps composite_id -> list of sub_ids
+
+    if order_ids:
+        target_ids = set()
+        for raw_id in order_ids:
+            s_raw = str(raw_id).strip()
+            if not s_raw:
+                continue
+            if "," in s_raw:
+                parts = [p.strip() for p in s_raw.split(",") if p.strip()]
+                target_ids.update(parts)
+                composite_map[s_raw] = parts
+            else:
+                target_ids.add(s_raw)
 
     try:
         kite = get_zerodha_client()
@@ -890,10 +984,207 @@ def reconcile_zerodha_orders(order_ids: Optional[List[str]] = None) -> Dict[str,
                         "transaction_type": None
                     }
 
+        # Synthesize composite entries for sliced multi-order actions
+        for comp_id, parts in composite_map.items():
+            part_results = [results[pid] for pid in parts if pid in results]
+            if part_results:
+                tot_filled = sum(int(pr.get("filled_quantity", 0) or 0) for pr in part_results)
+                tot_pending = sum(int(pr.get("pending_quantity", 0) or 0) for pr in part_results)
+                tot_qty = sum(int(pr.get("total_quantity", 0) or 0) for pr in part_results)
+                tot_val = sum(float(pr.get("filled_quantity", 0) or 0) * float(pr.get("average_price", 0.0) or 0.0) for pr in part_results)
+                avg_p = tot_val / tot_filled if tot_filled > 0 else 0.0
+
+                statuses = [pr.get("status") for pr in part_results]
+                if all(s == "FILLED" for s in statuses):
+                    mapped_st = "FILLED"
+                    raw_st = "COMPLETE"
+                elif all(s in ["REJECTED", "FAILED"] for s in statuses):
+                    mapped_st = "REJECTED"
+                    raw_st = "REJECTED"
+                elif all(s == "CANCELLED" for s in statuses):
+                    mapped_st = "CANCELLED"
+                    raw_st = "CANCELLED"
+                elif any(s == "FILLED" for s in statuses) or tot_filled > 0:
+                    mapped_st = "PARTIAL_FILL"
+                    raw_st = "PARTIAL"
+                elif any(s == "OPEN_LIMIT" for s in statuses):
+                    mapped_st = "OPEN_LIMIT"
+                    raw_st = "OPEN"
+                elif any(s == "TRIGGER_PENDING" for s in statuses):
+                    mapped_st = "TRIGGER_PENDING"
+                    raw_st = "TRIGGER PENDING"
+                else:
+                    mapped_st = statuses[0] if statuses else "SUBMITTED"
+                    raw_st = "SUBMITTED"
+
+                msgs = [pr.get("status_message") for pr in part_results if pr.get("status_message")]
+
+                results[comp_id] = {
+                    "order_id": comp_id,
+                    "status": mapped_st,
+                    "raw_status": raw_st,
+                    "filled_quantity": tot_filled,
+                    "pending_quantity": tot_pending,
+                    "total_quantity": tot_qty,
+                    "average_price": avg_p,
+                    "status_message": " | ".join(msgs) if msgs else "",
+                    "tradingsymbol": part_results[0].get("tradingsymbol"),
+                    "transaction_type": part_results[0].get("transaction_type")
+                }
+
     except Exception as e:
         logger.warning(f"Error during bulk Zerodha order reconciliation: {e}")
 
     return results
+
+
+def _place_single_order_leg(
+    kite: Any,
+    tt: str,
+    ot: str,
+    prod: str,
+    exchange: str,
+    tradingsymbol: str,
+    quantity: int,
+    final_price: Optional[float],
+    final_trigger_price: Optional[float],
+    validity: str,
+    verify_confirmation: bool
+) -> dict:
+    """
+    Submits a single order leg to Zerodha Kite API with AMO retry and confirmation verification.
+    """
+    order_id = None
+    variety_used = kite.VARIETY_REGULAR
+    try:
+        order_id = kite.place_order(
+            variety=variety_used,
+            exchange=exchange,
+            tradingsymbol=tradingsymbol,
+            transaction_type=tt,
+            quantity=int(quantity),
+            product=prod,
+            order_type=ot,
+            price=final_price,
+            trigger_price=final_trigger_price,
+            validity=validity
+        )
+    except Exception as reg_err:
+        err_cat_info = classify_broker_error(reg_err)
+        if err_cat_info["is_market_closed"]:
+            logger.info(f"Market closed condition detected ({reg_err}). Retrying order placement with VARIETY_AMO...")
+            variety_used = kite.VARIETY_AMO
+            try:
+                order_id = kite.place_order(
+                    variety=kite.VARIETY_AMO,
+                    exchange=exchange,
+                    tradingsymbol=tradingsymbol,
+                    transaction_type=tt,
+                    quantity=int(quantity),
+                    product=prod,
+                    order_type=ot,
+                    price=final_price,
+                    trigger_price=final_trigger_price,
+                    validity=validity
+                )
+            except Exception as amo_err:
+                amo_cat_info = classify_broker_error(amo_err)
+                logger.warning(f"AMO order placement also failed [{amo_cat_info['error_class']}]: {amo_err}")
+                return {
+                    "success": False,
+                    "order_id": None,
+                    "status": "REJECTED" if amo_cat_info["is_market_closed"] or amo_cat_info["is_invalid_instrument"] else "FAILED",
+                    "raw_status": "REJECTED" if amo_cat_info["is_market_closed"] or amo_cat_info["is_invalid_instrument"] else "FAILED",
+                    "message": f"Order placement failed: {amo_err}",
+                    "status_message": str(amo_err),
+                    "error_category": amo_cat_info["category"],
+                    "error_class": amo_cat_info["error_class"],
+                    "filled_quantity": 0,
+                    "pending_quantity": 0,
+                    "average_price": 0.0
+                }
+        else:
+            logger.error(f"Zerodha order placement failed [{err_cat_info['error_class']}]: {reg_err}")
+            return {
+                "success": False,
+                "order_id": None,
+                "status": "REJECTED" if err_cat_info["category"] in [BrokerErrorCategory.MARGIN_EXHAUSTION, BrokerErrorCategory.CIRCUIT_LIMIT, BrokerErrorCategory.INVALID_INSTRUMENT] else "FAILED",
+                "raw_status": "REJECTED" if err_cat_info["category"] in [BrokerErrorCategory.MARGIN_EXHAUSTION, BrokerErrorCategory.CIRCUIT_LIMIT, BrokerErrorCategory.INVALID_INSTRUMENT] else "FAILED",
+                "message": f"Order placement failed: {reg_err}",
+                "status_message": str(reg_err),
+                "error_category": err_cat_info["category"],
+                "error_class": err_cat_info["error_class"],
+                "filled_quantity": 0,
+                "pending_quantity": 0,
+                "average_price": 0.0
+            }
+
+    logger.info(f"Order submitted to Zerodha ({'AMO' if variety_used == kite.VARIETY_AMO else 'REGULAR'}). Order ID: {order_id}")
+
+    status_name = "OPEN_LIMIT" if ot == kite.ORDER_TYPE_LIMIT else "SUBMITTED"
+    raw_status = "OPEN" if ot == kite.ORDER_TYPE_LIMIT else "SUBMITTED"
+    status_msg = None
+    filled_qty = 0
+    pending_qty = int(quantity)
+    avg_price = 0.0
+
+    if verify_confirmation and order_id:
+        ver_info = verify_zerodha_order_confirmation(str(order_id))
+        raw_status = ver_info.get("raw_status") or ver_info.get("status", "OPEN")
+        status_name = ver_info.get("status", "OPEN_LIMIT")
+        status_msg = ver_info.get("status_message")
+        filled_qty = int(ver_info.get("filled_quantity", 0) or 0)
+        pending_qty = int(ver_info.get("pending_quantity", int(quantity) - filled_qty) or 0)
+        avg_price = float(ver_info.get("average_price", 0.0) or 0.0)
+
+        if status_name == "REJECTED" or raw_status == "REJECTED":
+            rej_reason = status_msg or "Rejected by Zerodha RMS"
+            err_cat_info = classify_broker_error(rej_reason)
+            logger.error(f"Zerodha RMS rejected order {order_id} [{err_cat_info['error_class']}]: {rej_reason}")
+            return {
+                "success": False,
+                "order_id": str(order_id),
+                "status": "REJECTED",
+                "raw_status": raw_status,
+                "message": f"Order {order_id} rejected by Zerodha RMS: {rej_reason}",
+                "status_message": rej_reason,
+                "error_category": err_cat_info["category"],
+                "error_class": err_cat_info["error_class"],
+                "filled_quantity": filled_qty,
+                "pending_quantity": pending_qty,
+                "average_price": avg_price
+            }
+        elif status_name == "CANCELLED" or raw_status == "CANCELLED":
+            can_reason = status_msg or "Order cancelled"
+            err_cat_info = classify_broker_error(can_reason)
+            logger.error(f"Order {order_id} was cancelled [{err_cat_info['error_class']}]: {can_reason}")
+            return {
+                "success": False,
+                "order_id": str(order_id),
+                "status": "CANCELLED",
+                "raw_status": raw_status,
+                "message": f"Order {order_id} cancelled: {can_reason}",
+                "status_message": can_reason,
+                "error_category": err_cat_info["category"],
+                "error_class": err_cat_info["error_class"],
+                "filled_quantity": filled_qty,
+                "pending_quantity": pending_qty,
+                "average_price": avg_price
+            }
+
+    return {
+        "success": True,
+        "order_id": str(order_id),
+        "status": status_name,
+        "raw_status": raw_status,
+        "message": f"Order placed successfully. Order ID: {order_id}" + (f" ({status_name})" if status_name not in ["SUBMITTED", "OPEN"] else ""),
+        "status_message": status_msg,
+        "error_category": None,
+        "error_class": None,
+        "filled_quantity": filled_qty,
+        "pending_quantity": pending_qty,
+        "average_price": avg_price
+    }
 
 
 def place_zerodha_order(
@@ -906,10 +1197,14 @@ def place_zerodha_order(
     price: float = None,
     trigger_price: float = None,
     validity: str = "DAY",
-    verify_confirmation: bool = True
+    verify_confirmation: bool = True,
+    freeze_limit: Optional[int] = None,
+    lot_size: Optional[int] = None
 ) -> dict:
     """
     Executes an order on Zerodha Kite API via proxy.
+    Automatically enforces exchange freeze limits and performs iceberg order slicing
+    when total target quantity exceeds the maximum single order size.
     Optionally verifies exchange acceptance/confirmation to catch immediate RMS margin rejections.
     Returns dict: {"success": bool, "order_id": str, "status": str, "message": str, "status_message": str|None}
     """
@@ -975,136 +1270,175 @@ def place_zerodha_order(
             dir_sl = "UP" if str(transaction_type).upper() == "BUY" else "DOWN"
             final_trigger_price = round_to_tick(trigger_price, tick_size=0.05, direction=dir_sl)
 
-        order_id = None
-        variety_used = kite.VARIETY_REGULAR
-        try:
-            order_id = kite.place_order(
-                variety=variety_used,
+        # Exchange Freeze Limit Checking & Iceberg Slicing
+        eff_freeze_limit = freeze_limit if (freeze_limit is not None and freeze_limit > 0) else get_freeze_quantity(
+            tradingsymbol=tradingsymbol,
+            lot_size=lot_size
+        )
+        slices = slice_order_quantity(
+            total_quantity=int(quantity),
+            freeze_limit=eff_freeze_limit,
+            lot_size=lot_size or 1
+        )
+
+        # If order fits in a single slice (standard order)
+        if len(slices) <= 1:
+            single_res = _place_single_order_leg(
+                kite=kite,
+                tt=tt,
+                ot=ot,
+                prod=prod,
                 exchange=exchange,
                 tradingsymbol=tradingsymbol,
-                transaction_type=tt,
                 quantity=int(quantity),
-                product=prod,
-                order_type=ot,
-                price=final_price,
-                trigger_price=final_trigger_price,
-                validity=validity
+                final_price=final_price,
+                final_trigger_price=final_trigger_price,
+                validity=validity,
+                verify_confirmation=verify_confirmation
             )
-        except Exception as reg_err:
-            err_cat_info = classify_broker_error(reg_err)
-            if err_cat_info["is_market_closed"]:
-                logger.info(f"Market closed condition detected ({reg_err}). Retrying order placement with VARIETY_AMO...")
-                variety_used = kite.VARIETY_AMO
-                try:
-                    order_id = kite.place_order(
-                        variety=kite.VARIETY_AMO,
-                        exchange=exchange,
-                        tradingsymbol=tradingsymbol,
-                        transaction_type=tt,
-                        quantity=int(quantity),
-                        product=prod,
-                        order_type=ot,
-                        price=final_price,
-                        trigger_price=final_trigger_price,
-                        validity=validity
-                    )
-                except Exception as amo_err:
-                    amo_cat_info = classify_broker_error(amo_err)
-                    logger.warning(f"AMO order placement also failed [{amo_cat_info['error_class']}]: {amo_err}")
-                    return {
-                        "success": False,
-                        "order_id": None,
-                        "status": "REJECTED" if amo_cat_info["is_market_closed"] or amo_cat_info["is_invalid_instrument"] else "FAILED",
-                        "raw_status": "REJECTED" if amo_cat_info["is_market_closed"] or amo_cat_info["is_invalid_instrument"] else "FAILED",
-                        "message": f"Order placement failed: {amo_err}",
-                        "status_message": str(amo_err),
-                        "error_category": amo_cat_info["category"],
-                        "error_class": amo_cat_info["error_class"],
-                        "filled_quantity": 0,
-                        "pending_quantity": 0,
-                        "average_price": 0.0
-                    }
+            single_res["freeze_limit"] = eff_freeze_limit
+            single_res["slices"] = slices
+            single_res["is_sliced"] = False
+            single_res["slice_count"] = 1
+            single_res["order_ids"] = [single_res["order_id"]] if single_res.get("order_id") else []
+            return single_res
+
+        # If order exceeds freeze limit, execute automated iceberg order slices sequentially
+        logger.info(
+            f"Quantity {quantity} exceeds freeze limit {eff_freeze_limit} for {tradingsymbol}. "
+            f"Automated iceberg order slicing into {len(slices)} sub-orders: {slices}"
+        )
+
+        order_ids = []
+        slice_results = []
+        total_filled = 0
+        total_pending = 0
+        weighted_price_sum = 0.0
+        overall_failed = False
+        failed_err = None
+
+        for s_idx, s_qty in enumerate(slices):
+            logger.info(f"Submitting order slice {s_idx + 1}/{len(slices)}: {tt} {s_qty} x {tradingsymbol} ({ot})")
+            s_res = _place_single_order_leg(
+                kite=kite,
+                tt=tt,
+                ot=ot,
+                prod=prod,
+                exchange=exchange,
+                tradingsymbol=tradingsymbol,
+                quantity=s_qty,
+                final_price=final_price,
+                final_trigger_price=final_trigger_price,
+                validity=validity,
+                verify_confirmation=verify_confirmation
+            )
+            slice_results.append(s_res)
+
+            if s_res.get("order_id"):
+                order_ids.append(str(s_res["order_id"]))
+
+            filled = int(s_res.get("filled_quantity", 0) or 0)
+            avg_p = float(s_res.get("average_price", 0.0) or 0.0)
+            total_filled += filled
+            weighted_price_sum += (filled * avg_p)
+
+            if not s_res.get("success", False) or s_res.get("status") in ["REJECTED", "CANCELLED", "FAILED"]:
+                logger.warning(
+                    f"Slice {s_idx + 1}/{len(slices)} (qty {s_qty}) failed/rejected: {s_res.get('message')}. "
+                    f"Halting remaining slices."
+                )
+                overall_failed = True
+                failed_err = s_res
+                break
+
+        total_pending = max(0, int(quantity) - total_filled)
+        avg_fill_price = (weighted_price_sum / total_filled) if total_filled > 0 else 0.0
+        joined_order_id = ",".join(order_ids) if order_ids else None
+
+        if not overall_failed and order_ids:
+            if total_filled >= int(quantity):
+                st_name = "FILLED"
+                raw_st = "COMPLETE"
+            elif ot == kite.ORDER_TYPE_LIMIT:
+                st_name = "OPEN_LIMIT" if total_filled == 0 else "PARTIAL_FILL"
+                raw_st = "OPEN" if total_filled == 0 else "PARTIAL"
             else:
-                logger.error(f"Zerodha order placement failed [{err_cat_info['error_class']}]: {reg_err}")
+                st_name = "SUBMITTED" if total_filled == 0 else "PARTIAL_FILL"
+                raw_st = "SUBMITTED" if total_filled == 0 else "PARTIAL"
+
+            return {
+                "success": True,
+                "order_id": joined_order_id,
+                "order_ids": order_ids,
+                "is_sliced": True,
+                "slice_count": len(slices),
+                "slices": slices,
+                "freeze_limit": eff_freeze_limit,
+                "status": st_name,
+                "raw_status": raw_st,
+                "message": f"Placed {len(order_ids)} sliced orders (total qty {quantity}, freeze limit {eff_freeze_limit}): {joined_order_id}",
+                "status_message": None,
+                "error_category": None,
+                "error_class": None,
+                "filled_quantity": total_filled,
+                "pending_quantity": total_pending,
+                "average_price": avg_fill_price
+            }
+        else:
+            if total_filled > 0 or (order_ids and not all(s.get("status") in ["REJECTED", "FAILED"] for s in slice_results)):
                 return {
                     "success": False,
+                    "order_id": joined_order_id,
+                    "order_ids": order_ids,
+                    "is_sliced": True,
+                    "slice_count": len(slices),
+                    "slices": slices,
+                    "freeze_limit": eff_freeze_limit,
+                    "status": "PARTIAL_FILL" if total_filled > 0 else (failed_err.get("status") if failed_err else "FAILED"),
+                    "raw_status": "PARTIAL" if total_filled > 0 else (failed_err.get("raw_status") if failed_err else "FAILED"),
+                    "message": f"Partial slice placement: {len(order_ids)}/{len(slices)} placed. Error on slice: {failed_err.get('message') if failed_err else 'Unknown error'}",
+                    "status_message": failed_err.get("status_message") if failed_err else None,
+                    "error_category": failed_err.get("error_category") if failed_err else None,
+                    "error_class": failed_err.get("error_class") if failed_err else None,
+                    "filled_quantity": total_filled,
+                    "pending_quantity": total_pending,
+                    "average_price": avg_fill_price
+                }
+            else:
+                return failed_err or {
+                    "success": False,
                     "order_id": None,
-                    "status": "REJECTED" if err_cat_info["category"] in [BrokerErrorCategory.MARGIN_EXHAUSTION, BrokerErrorCategory.CIRCUIT_LIMIT, BrokerErrorCategory.INVALID_INSTRUMENT] else "FAILED",
-                    "raw_status": "REJECTED" if err_cat_info["category"] in [BrokerErrorCategory.MARGIN_EXHAUSTION, BrokerErrorCategory.CIRCUIT_LIMIT, BrokerErrorCategory.INVALID_INSTRUMENT] else "FAILED",
-                    "message": f"Order placement failed: {reg_err}",
-                    "status_message": str(reg_err),
-                    "error_category": err_cat_info["category"],
-                    "error_class": err_cat_info["error_class"],
+                    "order_ids": [],
+                    "is_sliced": True,
+                    "slice_count": len(slices),
+                    "slices": slices,
+                    "freeze_limit": eff_freeze_limit,
+                    "status": "FAILED",
+                    "raw_status": "FAILED",
+                    "message": "All order slices failed",
+                    "status_message": "All order slices failed",
+                    "error_category": BrokerErrorCategory.GENERAL_ERROR,
+                    "error_class": BROKER_ERROR_CLASS_NAMES[BrokerErrorCategory.GENERAL_ERROR],
                     "filled_quantity": 0,
-                    "pending_quantity": 0,
+                    "pending_quantity": int(quantity),
                     "average_price": 0.0
                 }
 
-        logger.info(f"Order submitted to Zerodha ({'AMO' if variety_used == kite.VARIETY_AMO else 'REGULAR'}). Order ID: {order_id}")
-
-        status_name = "OPEN_LIMIT" if ot == kite.ORDER_TYPE_LIMIT else "SUBMITTED"
-        raw_status = "OPEN" if ot == kite.ORDER_TYPE_LIMIT else "SUBMITTED"
-        status_msg = None
-        filled_qty = 0
-        pending_qty = int(quantity)
-        avg_price = 0.0
-
-        if verify_confirmation and order_id:
-            ver_info = verify_zerodha_order_confirmation(str(order_id))
-            raw_status = ver_info.get("raw_status") or ver_info.get("status", "OPEN")
-            status_name = ver_info.get("status", "OPEN_LIMIT")
-            status_msg = ver_info.get("status_message")
-            filled_qty = int(ver_info.get("filled_quantity", 0) or 0)
-            pending_qty = int(ver_info.get("pending_quantity", int(quantity) - filled_qty) or 0)
-            avg_price = float(ver_info.get("average_price", 0.0) or 0.0)
-
-            if status_name == "REJECTED" or raw_status == "REJECTED":
-                rej_reason = status_msg or "Rejected by Zerodha RMS"
-                err_cat_info = classify_broker_error(rej_reason)
-                logger.error(f"Zerodha RMS rejected order {order_id} [{err_cat_info['error_class']}]: {rej_reason}")
-                return {
-                    "success": False,
-                    "order_id": str(order_id),
-                    "status": "REJECTED",
-                    "raw_status": raw_status,
-                    "message": f"Order {order_id} rejected by Zerodha RMS: {rej_reason}",
-                    "status_message": rej_reason,
-                    "error_category": err_cat_info["category"],
-                    "error_class": err_cat_info["error_class"],
-                    "filled_quantity": filled_qty,
-                    "pending_quantity": pending_qty,
-                    "average_price": avg_price
-                }
-            elif status_name == "CANCELLED" or raw_status == "CANCELLED":
-                can_reason = status_msg or "Order cancelled"
-                err_cat_info = classify_broker_error(can_reason)
-                logger.error(f"Order {order_id} was cancelled [{err_cat_info['error_class']}]: {can_reason}")
-                return {
-                    "success": False,
-                    "order_id": str(order_id),
-                    "status": "CANCELLED",
-                    "raw_status": raw_status,
-                    "message": f"Order {order_id} cancelled: {can_reason}",
-                    "status_message": can_reason,
-                    "error_category": err_cat_info["category"],
-                    "error_class": err_cat_info["error_class"],
-                    "filled_quantity": filled_qty,
-                    "pending_quantity": pending_qty,
-                    "average_price": avg_price
-                }
-
+    except Exception as e:
+        logger.exception(f"Error placing Zerodha order: {e}")
+        err_cat_info = classify_broker_error(e)
         return {
-            "success": True,
-            "order_id": str(order_id),
-            "status": status_name,
-            "raw_status": raw_status,
-            "message": f"Order placed successfully. Order ID: {order_id}" + (f" ({status_name})" if status_name not in ["SUBMITTED", "OPEN"] else ""),
-            "status_message": status_msg,
-            "error_category": None,
-            "error_class": None,
-            "filled_quantity": filled_qty,
-            "pending_quantity": pending_qty,
-            "average_price": avg_price
+            "success": False,
+            "order_id": None,
+            "status": "FAILED",
+            "raw_status": "FAILED",
+            "message": str(e),
+            "status_message": str(e),
+            "error_category": err_cat_info["category"],
+            "error_class": err_cat_info["error_class"],
+            "filled_quantity": 0,
+            "pending_quantity": 0,
+            "average_price": 0.0
         }
 
     except Exception as e:

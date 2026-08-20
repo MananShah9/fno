@@ -106,7 +106,10 @@ def init_db():
             "sl_triggered": "BOOLEAN DEFAULT FALSE",
             "sl_triggered_at": "TIMESTAMP",
             "sl_order_id": "VARCHAR",
-            "sl_order_status": "VARCHAR"
+            "sl_order_status": "VARCHAR",
+            "is_sliced": "BOOLEAN DEFAULT FALSE",
+            "slice_count": "INTEGER DEFAULT 1",
+            "freeze_limit": "INTEGER"
         }
 
         with engine.begin() as conn:

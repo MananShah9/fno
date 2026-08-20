@@ -95,6 +95,11 @@ class Action(Base):
     zerodha_response = Column(Text, nullable=True)
     placed_at = Column(DateTime, nullable=True)
 
+    # Order Slicing / Freeze Limits (Iceberg Orders)
+    is_sliced = Column(Boolean, default=False, index=True) # True if order quantity exceeded freeze limit and was sliced
+    slice_count = Column(Integer, default=1)               # Number of child order slices placed
+    freeze_limit = Column(Integer, nullable=True)          # Applied exchange freeze quantity limit
+
     # Stoploss Dual-Classification & Spot Monitoring Parameters
     sl_trigger_type = Column(String, nullable=True, index=True)        # "OPTION_PREMIUM_TRIGGER" or "UNDERLYING_SPOT_TRIGGER"
     sl_trigger_price = Column(Float, nullable=True)                    # Numeric trigger price level

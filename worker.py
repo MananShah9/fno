@@ -20,7 +20,8 @@ from gemini_client import (
 from instruments_manager import (
     resolve_nfo_instrument, parse_price_value, round_to_tick, calculate_lots_from_budget,
     calculate_position_size, classify_strategy_type, get_margin_tier_estimate,
-    get_max_lot_cap, is_index_symbol, get_spot_instrument_key
+    get_max_lot_cap, is_index_symbol, get_spot_instrument_key,
+    get_freeze_quantity, slice_order_quantity
 )
 from zerodha_client import (
     place_zerodha_order, check_existing_zerodha_order_or_position, get_nfo_ltp,
@@ -751,26 +752,46 @@ def process_zerodha_postback(payload: dict, session: Session) -> dict:
     if not order_id:
         return {"success": False, "message": "Missing order_id in postback"}
 
-    action = session.query(Action).filter(Action.zerodha_order_id == order_id).first()
+    action = session.query(Action).filter(
+        (Action.zerodha_order_id == order_id) | (Action.zerodha_order_id.contains(order_id))
+    ).first()
     if not action:
         logger.warning(f"Zerodha postback received for unknown order_id: {order_id}")
         return {"success": False, "message": f"Order {order_id} not found in database"}
 
     old_status = action.order_status
-    raw_status = str(payload.get("status", "")).strip().upper()
-    filled_qty = int(payload.get("filled_quantity", 0) or 0)
-    total_qty = int(payload.get("quantity", action.quantity or 0) or 0)
-    pending_qty = int(payload.get("pending_quantity", total_qty - filled_qty) or 0)
-    avg_price = float(payload.get("average_price", 0.0) or 0.0)
-    status_msg = str(payload.get("status_message", "") or "")
-    order_type = payload.get("order_type") or action.order_type
+    if action.zerodha_order_id and "," in action.zerodha_order_id:
+        reconciled = reconcile_zerodha_orders([action.zerodha_order_id])
+        ord_info = reconciled.get(action.zerodha_order_id)
+        if ord_info:
+            new_status = ord_info.get("status") or old_status
+            filled_qty = int(ord_info.get("filled_quantity", action.filled_quantity or 0) or 0)
+            pending_qty = int(ord_info.get("pending_quantity", action.pending_quantity or 0) or 0)
+            total_qty = int(ord_info.get("total_quantity", action.quantity or 0) or 0)
+            avg_price = float(ord_info.get("average_price", action.average_price or 0.0) or 0.0)
+            status_msg = ord_info.get("status_message") or ""
+        else:
+            new_status = old_status
+            filled_qty = int(payload.get("filled_quantity", 0) or 0)
+            total_qty = int(payload.get("quantity", action.quantity or 0) or 0)
+            pending_qty = int(payload.get("pending_quantity", 0) or 0)
+            avg_price = float(payload.get("average_price", 0.0) or 0.0)
+            status_msg = str(payload.get("status_message", "") or "")
+    else:
+        raw_status = str(payload.get("status", "")).strip().upper()
+        filled_qty = int(payload.get("filled_quantity", 0) or 0)
+        total_qty = int(payload.get("quantity", action.quantity or 0) or 0)
+        pending_qty = int(payload.get("pending_quantity", total_qty - filled_qty) or 0)
+        avg_price = float(payload.get("average_price", 0.0) or 0.0)
+        status_msg = str(payload.get("status_message", "") or "")
+        order_type = payload.get("order_type") or action.order_type
 
-    new_status = map_zerodha_status_to_action_status(
-        raw_status=raw_status,
-        filled_qty=filled_qty,
-        total_qty=total_qty,
-        order_type=order_type
-    )
+        new_status = map_zerodha_status_to_action_status(
+            raw_status=raw_status,
+            filled_qty=filled_qty,
+            total_qty=total_qty,
+            order_type=order_type
+        )
 
     action.order_status = new_status
     action.filled_quantity = filled_qty
@@ -1425,7 +1446,10 @@ def process_trade_actions_and_sizing(
             transaction_type=trans_type,
             order_type=ord_type,
             product=getattr(schema, "product", None) or "NRML",
-            order_status="PENDING"
+            order_status="PENDING",
+            freeze_limit=inst.get("freeze_qty") if inst else get_freeze_quantity(tradingsymbol=inst["tradingsymbol"] if inst else None, underlying=item["underlying"]),
+            is_sliced=False,
+            slice_count=1
         )
         actions_to_add.append(db_action)
 
@@ -1614,6 +1638,36 @@ def execute_trade_actions(
                 action.order_type = "MARKET"
                 limit_price = None
 
+        # Determine contract lot_size and freeze limit
+        lot_sz = int(action.quantity / (action.lots or 1)) if action.quantity and action.lots else 1
+        freeze_lim = get_freeze_quantity(
+            tradingsymbol=action.tradingsymbol,
+            underlying=action.underlying,
+            lot_size=lot_sz
+        )
+        if action.quantity and action.quantity > freeze_lim:
+            slices = slice_order_quantity(action.quantity, freeze_lim, lot_sz)
+            logger.info(
+                f"Action ID {action.id} quantity {action.quantity} exceeds exchange freeze limit {freeze_lim}. "
+                f"Slicing order into {len(slices)} sub-orders: {slices}"
+            )
+            record_stage(
+                stage="ORDER_SLICED",
+                status="INFO",
+                message_id=action.message_id,
+                trade_id=action.trade_id,
+                details={
+                    "action_id": action.id,
+                    "tradingsymbol": action.tradingsymbol,
+                    "total_quantity": action.quantity,
+                    "freeze_limit": freeze_lim,
+                    "lot_size": lot_sz,
+                    "slices_count": len(slices),
+                    "slices": slices
+                },
+                session=session
+            )
+
         logger.info(f"Executing Zerodha order for Action ID {action.id}: {action.transaction_type} {action.quantity} x {action.tradingsymbol} ({action.order_type})")
 
         res = place_zerodha_order(
@@ -1623,7 +1677,9 @@ def execute_trade_actions(
             exchange="NFO",
             order_type=action.order_type or "MARKET",
             product=action.product or "NRML",
-            price=limit_price
+            price=limit_price,
+            freeze_limit=freeze_lim,
+            lot_size=lot_sz
         )
 
         if res["success"]:
@@ -1635,6 +1691,9 @@ def execute_trade_actions(
             action.filled_quantity = int(res.get("filled_quantity", 0) or 0)
             action.pending_quantity = int(res.get("pending_quantity", (action.quantity or 0) - (action.filled_quantity or 0)) or 0)
             action.average_price = float(res.get("average_price", 0.0) or 0.0)
+            action.is_sliced = bool(res.get("is_sliced", len(res.get("slices", [])) > 1))
+            action.slice_count = int(res.get("slice_count", len(res.get("slices", [1]))) or 1)
+            action.freeze_limit = int(res.get("freeze_limit", freeze_lim) or freeze_lim)
             action.last_reconciled_at = datetime.utcnow()
 
             record_stage(
@@ -1650,6 +1709,11 @@ def execute_trade_actions(
                     "order_type": action.order_type,
                     "price": limit_price,
                     "order_id": res["order_id"],
+                    "order_ids": res.get("order_ids", [res["order_id"]] if res.get("order_id") else []),
+                    "is_sliced": action.is_sliced,
+                    "slice_count": action.slice_count,
+                    "slices": res.get("slices"),
+                    "freeze_limit": action.freeze_limit,
                     "order_status": action.order_status,
                     "filled_quantity": action.filled_quantity,
                     "pending_quantity": action.pending_quantity,
@@ -1676,6 +1740,13 @@ def execute_trade_actions(
             action.zerodha_response = res["message"]
             action.rejection_reason = res.get("status_message") or res["message"]
             action.error_category = res.get("error_category")
+            if res.get("order_id"):
+                action.zerodha_order_id = res["order_id"]
+            action.filled_quantity = int(res.get("filled_quantity", 0) or 0)
+            action.pending_quantity = int(res.get("pending_quantity", (action.quantity or 0) - (action.filled_quantity or 0)) or 0)
+            action.is_sliced = bool(res.get("is_sliced", len(res.get("slices", [])) > 1))
+            action.slice_count = int(res.get("slice_count", len(res.get("slices", [1]))) or 1)
+            action.freeze_limit = int(res.get("freeze_limit", freeze_lim) or freeze_lim)
             action.last_reconciled_at = datetime.utcnow()
             record_stage(
                 stage="ORDER_FAILED" if action.order_status == "FAILED" else "ORDER_REJECTED",

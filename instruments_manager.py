@@ -25,6 +25,49 @@ KNOWN_INDEX_SYMBOLS = {
     "SENSEX", "BANKEX", "NIFTYIT", "NIFTY50", "NIFTYBANK", "CNXNIFTY", "CNXIT", "CNXFINANCE"
 }
 
+# Known Exchange Freeze Quantity Limits (NSE / BSE F&O)
+# NSE enforces strict maximum quantity per single order (Freeze Limits).
+# Orders exceeding freeze limit are rejected outright by broker RMS if not sliced.
+KNOWN_FREEZE_LIMITS = {
+    # Market Indices
+    "NIFTY": 1800,
+    "NIFTY50": 1800,
+    "NIFTY 50": 1800,
+    "BANKNIFTY": 900,
+    "NIFTYBANK": 900,
+    "NIFTY BANK": 900,
+    "FINNIFTY": 1800,
+    "CNXFINANCE": 1800,
+    "MIDCPNIFTY": 4200,
+    "NIFTYNXT50": 1800,
+    "SENSEX": 1000,
+    "BANKEX": 900,
+    # High-volume Stock F&O standard freeze limits (NSE circular caps)
+    "RELIANCE": 4500,
+    "TATASTEEL": 55000,
+    "HDFCBANK": 5500,
+    "ICICIBANK": 7000,
+    "SBIN": 15000,
+    "INFY": 2400,
+    "TCS": 1750,
+    "BAJFINANCE": 1250,
+    "AXISBANK": 6250,
+    "KOTAKBANK": 4000,
+    "LT": 1800,
+    "ITC": 16000,
+    "MARUTI": 500,
+    "BHARTIARTL": 9500,
+    "COALINDIA": 21000,
+    "BHEL": 35000,
+    "NATIONALUM": 37500,
+    "VBL": 6000,
+    "INDIGO": 3000,
+}
+
+DEFAULT_INDEX_FREEZE_LIMIT = 1800
+DEFAULT_STOCK_FREEZE_LOT_MULTIPLIER = 20
+DEFAULT_STOCK_FREEZE_LIMIT = 5000
+
 # Fallback tickers list used if NFO instruments master is inaccessible
 DEFAULT_FALLBACK_TICKERS = [
     "BANKNIFTY", "MIDCPNIFTY", "FINNIFTY", "NIFTY", "SENSEX", "BANKEX", "NIFTYNXT50",
@@ -229,8 +272,143 @@ def resolve_nfo_instrument(
     # Default to nearest active expiry contract
     return format_instrument_result(candidates[0])
 
+def get_freeze_quantity(
+    tradingsymbol: Optional[str] = None,
+    underlying: Optional[str] = None,
+    lot_size: Optional[int] = None,
+    instrument_row: Optional[Dict[str, Any]] = None
+) -> int:
+    """
+    Returns the maximum single order quantity allowed by exchange RMS (Freeze Limit)
+    for a given derivative contract / underlying.
+    
+    Order of precedence:
+      1. Explicit freeze quantity from NFO instruments CSV row (freeze_qty, freeze_quantity, max_quantity, freeze_limit)
+      2. Environment variable override (e.g., FREEZE_LIMIT_NIFTY, FREEZE_LIMIT_BANKNIFTY, FREEZE_LIMIT_<UNDERLYING>)
+      3. Static lookup table for known indices and stocks (KNOWN_FREEZE_LIMITS)
+      4. Default index freeze cap (1800) if underlying is an index
+      5. Stock lot size multiplier (e.g. lot_size * DEFAULT_STOCK_FREEZE_LOT_MULTIPLIER) or fallback stock limit (5000)
+    """
+    # 1. Check instrument row if provided
+    if instrument_row:
+        for k in ("freeze_qty", "freeze_quantity", "max_quantity", "freeze_limit"):
+            val = instrument_row.get(k)
+            if val is not None and str(val).strip() != "":
+                try:
+                    ival = int(float(val))
+                    if ival > 0:
+                        return ival
+                except (ValueError, TypeError):
+                    pass
+
+    # Extract clean underlying
+    clean_underlying = None
+    if underlying:
+        clean_underlying = re.sub(r'[^A-Z0-9]', '', str(underlying).strip().upper())
+    elif tradingsymbol:
+        sym = str(tradingsymbol).strip().upper()
+        # Check against known index symbols first
+        for idx in ("MIDCPNIFTY", "BANKNIFTY", "FINNIFTY", "NIFTYNXT50", "NIFTY", "SENSEX", "BANKEX"):
+            if sym.startswith(idx):
+                clean_underlying = idx
+                break
+        if not clean_underlying:
+            # Match alphabetic prefix before digits (e.g., "TATASTEEL26AUG..." -> "TATASTEEL")
+            m = re.match(r'^([A-Z]+)', sym)
+            if m:
+                clean_underlying = m.group(1)
+
+    # 2. Check environment variable override
+    if clean_underlying:
+        env_key = f"FREEZE_LIMIT_{clean_underlying}"
+        env_val = os.getenv(env_key)
+        if env_val:
+            try:
+                ival = int(env_val)
+                if ival > 0:
+                    return ival
+            except (ValueError, TypeError):
+                pass
+
+    # 3. Static lookup table for known symbols
+    if clean_underlying and clean_underlying in KNOWN_FREEZE_LIMITS:
+        return KNOWN_FREEZE_LIMITS[clean_underlying]
+
+    # 4. Check if index symbol
+    if clean_underlying and is_index_symbol(clean_underlying):
+        return int(os.getenv("DEFAULT_INDEX_FREEZE_LIMIT", DEFAULT_INDEX_FREEZE_LIMIT))
+
+    # 5. For stocks, use lot_size * multiplier if lot_size available
+    multiplier = int(os.getenv("DEFAULT_STOCK_FREEZE_LOT_MULTIPLIER", DEFAULT_STOCK_FREEZE_LOT_MULTIPLIER))
+    if lot_size and lot_size > 0:
+        return max(lot_size, lot_size * multiplier)
+
+    # Final fallback
+    return int(os.getenv("DEFAULT_STOCK_FREEZE_LIMIT", DEFAULT_STOCK_FREEZE_LIMIT))
+
+
+def slice_order_quantity(
+    total_quantity: int,
+    freeze_limit: int,
+    lot_size: int = 1
+) -> List[int]:
+    """
+    Slices a large order quantity into broker/exchange compliant sub-order slices (iceberg slicing)
+    such that each slice is <= freeze_limit, > 0, and preserves lot size multiples.
+    
+    Args:
+        total_quantity: Total target order quantity
+        freeze_limit: Maximum allowed single order quantity
+        lot_size: Contract lot size (default 1)
+        
+    Returns:
+        List[int] representing the quantity for each slice order.
+        e.g., total_quantity=3900, freeze_limit=1800, lot_size=65 -> [1755, 1755, 390]
+        e.g., total_quantity=1800, freeze_limit=900, lot_size=30 -> [900, 900]
+        e.g., total_quantity=65, freeze_limit=1800, lot_size=65 -> [65]
+    """
+    if total_quantity is None or total_quantity <= 0:
+        return []
+
+    if freeze_limit is None or freeze_limit <= 0 or total_quantity <= freeze_limit:
+        return [int(total_quantity)]
+
+    ls = max(1, int(lot_size or 1))
+    
+    # Calculate max slice size as a multiple of lot_size <= freeze_limit
+    if ls > 1 and freeze_limit >= ls:
+        max_slice = (freeze_limit // ls) * ls
+    else:
+        max_slice = freeze_limit
+
+    if max_slice <= 0:
+        max_slice = min(int(total_quantity), max(1, int(freeze_limit)))
+
+    slices = []
+    remaining = int(total_quantity)
+
+    while remaining > 0:
+        if remaining <= max_slice:
+            slices.append(remaining)
+            break
+        else:
+            slices.append(max_slice)
+            remaining -= max_slice
+
+    return slices
+
+
+get_instrument_freeze_limit = get_freeze_quantity
+
+
 def format_instrument_result(row: Dict[str, Any]) -> Dict[str, Any]:
     lot_size = int(row.get("lot_size", 1))
+    freeze_qty = get_freeze_quantity(
+        tradingsymbol=row.get("tradingsymbol"),
+        underlying=row.get("name"),
+        lot_size=lot_size,
+        instrument_row=row
+    )
     return {
         "tradingsymbol": row.get("tradingsymbol"),
         "instrument_token": int(row.get("instrument_token", 0)),
@@ -240,6 +418,7 @@ def format_instrument_result(row: Dict[str, Any]) -> Dict[str, Any]:
         "strike": float(row.get("strike", 0)),
         "tick_size": float(row.get("tick_size", 0.05)),
         "lot_size": lot_size,
+        "freeze_qty": freeze_qty,
         "instrument_type": row.get("instrument_type"),
         "segment": row.get("segment", "NFO-OPT"),
         "exchange": row.get("exchange", "NFO")

@@ -201,6 +201,7 @@ class TestWorkerTimeFilterIntegration(unittest.TestCase):
             self.assertEqual(traces[0].stage, "TIME_WINDOW_FILTER")
             self.assertEqual(traces[0].status, "SKIPPED")
         finally:
+            os.environ["TELEGRAM_TIME_FILTER_ENABLED"] = "false"
             self.session.query(MessageStageTrace).filter(MessageStageTrace.message_id == msg.id).delete()
             self.session.query(Message).filter(Message.id == msg.id).delete()
             self.session.commit()
