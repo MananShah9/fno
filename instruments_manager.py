@@ -4,6 +4,7 @@ import csv
 import io
 import math
 import logging
+import tempfile
 from decimal import Decimal
 from datetime import datetime
 from typing import Optional, Dict, Any, List
@@ -13,6 +14,11 @@ logger = logging.getLogger("instruments")
 
 DATA_DIR = "data"
 INSTRUMENTS_FILE = os.path.join(DATA_DIR, "nfo_instruments.csv")
+MIN_INSTRUMENTS_ROWS = 10000
+REQUIRED_CSV_HEADERS = {
+    "instrument_token", "tradingsymbol", "name",
+    "expiry", "strike", "lot_size", "instrument_type"
+}
 
 _cached_instruments: Optional[List[Dict[str, Any]]] = None
 _cached_fetch_date: Optional[str] = None
@@ -103,40 +109,107 @@ def get_proxy_dict():
         }
     return None
 
-def download_and_cache_nfo_instruments() -> str:
+def validate_nfo_csv_reader(reader: Any, min_rows: int = MIN_INSTRUMENTS_ROWS) -> bool:
     """
-    Downloads NFO instruments CSV from Kite API using proxy and saves to disk.
+    Validates a CSV reader for required NFO headers and minimum row count.
+    """
+    try:
+        header = next(reader, None)
+        if not header:
+            logger.error("NFO instruments CSV validation failed: Missing or empty header")
+            return False
+        header_clean = {str(col).strip() for col in header}
+        missing_cols = REQUIRED_CSV_HEADERS - header_clean
+        if missing_cols:
+            logger.error(f"NFO instruments CSV validation failed: Missing required columns: {missing_cols}")
+            return False
+        
+        row_count = sum(1 for _ in reader)
+        if row_count < min_rows:
+            logger.error(f"NFO instruments CSV validation failed: Insufficient row count ({row_count} < {min_rows})")
+            return False
+        return True
+    except Exception as e:
+        logger.error(f"NFO instruments CSV validation exception: {e}")
+        return False
+
+def validate_nfo_csv_content(csv_content: str, min_rows: int = MIN_INSTRUMENTS_ROWS) -> bool:
+    """
+    Validates raw CSV string content for required headers and minimum row count.
+    """
+    if not csv_content or len(csv_content) < 1000:
+        return False
+    return validate_nfo_csv_reader(csv.reader(io.StringIO(csv_content)), min_rows=min_rows)
+
+def validate_nfo_csv_file(file_path: str, min_rows: int = MIN_INSTRUMENTS_ROWS) -> bool:
+    """
+    Validates a CSV file on disk for required headers and minimum row count.
+    """
+    if not os.path.exists(file_path) or os.path.getsize(file_path) < 1000:
+        return False
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return validate_nfo_csv_reader(csv.reader(f), min_rows=min_rows)
+    except Exception as e:
+        logger.error(f"Failed to read NFO instruments file {file_path} for validation: {e}")
+        return False
+
+def download_and_cache_nfo_instruments(min_rows: int = MIN_INSTRUMENTS_ROWS) -> str:
+    """
+    Downloads NFO instruments CSV from Kite API using proxy and saves to disk atomically.
+    Validates CSV headers and minimum row count (>10,000) before updating the active cache.
     """
     os.makedirs(DATA_DIR, exist_ok=True)
     today_str = datetime.now().strftime("%Y-%m-%d")
 
-    # Check if already cached today
+    # Check if already cached today and valid
     if os.path.exists(INSTRUMENTS_FILE):
-        file_mtime = datetime.fromtimestamp(os.path.getmtime(INSTRUMENTS_FILE)).strftime("%Y-%m-%d")
-        if file_mtime == today_str and os.path.getsize(INSTRUMENTS_FILE) > 1000:
-            logger.info(f"Using cached NFO instruments file: {INSTRUMENTS_FILE}")
-            with open(INSTRUMENTS_FILE, "r", encoding="utf-8") as f:
-                return f.read()
+        try:
+            file_mtime = datetime.fromtimestamp(os.path.getmtime(INSTRUMENTS_FILE)).strftime("%Y-%m-%d")
+            if file_mtime == today_str and validate_nfo_csv_file(INSTRUMENTS_FILE, min_rows=min_rows):
+                logger.info(f"Using cached valid NFO instruments file: {INSTRUMENTS_FILE}")
+                with open(INSTRUMENTS_FILE, "r", encoding="utf-8") as f:
+                    return f.read()
+        except Exception as e:
+            logger.warning(f"Error checking cached file {INSTRUMENTS_FILE}: {e}")
 
     logger.info("Downloading fresh NFO instruments CSV from Kite API...")
     url = "https://api.kite.trade/instruments/NFO"
     proxies = get_proxy_dict()
+    temp_file_path = None
 
     try:
         r = requests.get(url, proxies=proxies, timeout=15)
         r.raise_for_status()
         csv_content = r.text
 
-        with open(INSTRUMENTS_FILE, "w", encoding="utf-8") as f:
+        # Validate CSV content before touching active cache
+        if not validate_nfo_csv_content(csv_content, min_rows=min_rows):
+            raise ValueError(f"Downloaded NFO instruments CSV failed validation (header check or row count < {min_rows})")
+
+        # Atomic write: write to temporary file first in the same directory, then atomic rename/replace
+        fd, temp_file_path = tempfile.mkstemp(prefix="nfo_instruments_", suffix=".tmp", dir=DATA_DIR)
+        with open(fd, "w", encoding="utf-8") as f:
             f.write(csv_content)
 
-        logger.info(f"Successfully downloaded and cached NFO instruments to {INSTRUMENTS_FILE}")
+        # Atomically replace destination file with validated temporary file
+        os.replace(temp_file_path, INSTRUMENTS_FILE)
+        temp_file_path = None
+
+        logger.info(f"Successfully downloaded, validated and atomically cached NFO instruments to {INSTRUMENTS_FILE}")
         return csv_content
     except Exception as e:
-        logger.error(f"Error downloading NFO instruments: {e}")
-        # Fallback to existing file if available
-        if os.path.exists(INSTRUMENTS_FILE):
-            logger.warning("Falling back to existing cached NFO instruments file")
+        logger.error(f"Error downloading or validating NFO instruments: {e}")
+        # Clean up temp file if present
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except Exception as ce:
+                logger.warning(f"Failed to remove temporary instruments file {temp_file_path}: {ce}")
+
+        # Fallback to existing valid cached file if available (even from a previous date)
+        if os.path.exists(INSTRUMENTS_FILE) and validate_nfo_csv_file(INSTRUMENTS_FILE, min_rows=min_rows):
+            logger.warning("Falling back to existing valid cached NFO instruments file")
             with open(INSTRUMENTS_FILE, "r", encoding="utf-8") as f:
                 return f.read()
         raise
