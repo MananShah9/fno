@@ -25,6 +25,24 @@ KNOWN_INDEX_SYMBOLS = {
     "SENSEX", "BANKEX", "NIFTYIT", "NIFTY50", "NIFTYBANK", "CNXNIFTY", "CNXIT", "CNXFINANCE"
 }
 
+# Standard Indian Derivative Month Name Mappings
+MONTH_NAME_TO_INT = {
+    "JAN": 1, "JANUARY": 1,
+    "FEB": 2, "FEBRUARY": 2,
+    "MAR": 3, "MARCH": 3,
+    "APR": 4, "APRIL": 4,
+    "MAY": 5,
+    "JUN": 6, "JUNE": 6,
+    "JUL": 7, "JULY": 7,
+    "AUG": 8, "AUGUST": 8,
+    "SEP": 9, "SEPT": 9, "SEPTEMBER": 9,
+    "OCT": 10, "OCTOBER": 10,
+    "NOV": 11, "NOVEMBER": 11,
+    "DEC": 12, "DECEMBER": 12
+}
+
+MONTHS_PAT = r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)"
+
 # Known Exchange Freeze Quantity Limits (NSE / BSE F&O)
 # NSE enforces strict maximum quantity per single order (Freeze Limits).
 # Orders exceeding freeze limit are rejected outright by broker RMS if not sliced.
@@ -188,6 +206,227 @@ def get_known_underlyings_set() -> set:
     get_known_underlyings()
     return _cached_underlyings_set or set(DEFAULT_FALLBACK_TICKERS)
 
+def is_monthly_contract(row: Dict[str, Any]) -> bool:
+    """
+    Determines if an instrument contract row is a standard Monthly expiry contract.
+    Monthly contracts in NSE/BSE F&O have 3-letter month abbreviations (JAN..DEC) in tradingsymbol
+    immediately following the 2-digit year prefix (e.g. NIFTY26AUG24500CE, TATASTEEL26AUG192.5PE).
+    Weekly contracts have single-digit or single-char month codes followed by 2-digit days
+    (e.g. NIFTY2680424500CE, NIFTY2690124500CE, NIFTY26O0624500CE).
+    """
+    sym = str(row.get("tradingsymbol", "")).strip().upper()
+    name = str(row.get("name", "")).strip().upper()
+    if name and sym.startswith(name):
+        rem = sym[len(name):]
+        if re.match(rf"^\d{{2}}{MONTHS_PAT}", rem):
+            return True
+        return False
+    clean_name = re.sub(r"[^A-Z0-9]", "", name)
+    if clean_name and sym.startswith(clean_name):
+        rem = sym[len(clean_name):]
+        if re.match(rf"^\d{{2}}{MONTHS_PAT}", rem):
+            return True
+        return False
+    return bool(re.search(rf"\d{{2}}{MONTHS_PAT}", sym))
+
+
+def parse_expiry_hint(hint: Optional[str]) -> Optional[Dict[str, Any]]:
+    """
+    Translates natural language expiry phrases (e.g., 'Aug Series', 'Monthly', '11 Aug', '4th Aug',
+    'Current Month', 'Next Month', '28JUL2026', '2026-08-04') into structured normalized metadata.
+    
+    Returns a dict with metadata:
+      - 'type': 'exact_date' | 'specific_day_month' | 'month_series' | 'relative_month' | 'relative_week' | 'raw'
+      - 'iso': 'YYYY-MM-DD' (if exact_date)
+      - 'day': int (if specific_day_month)
+      - 'month': int (1-12)
+      - 'year': int (e.g. 2026) or None
+      - 'offset': int (0 for current, 1 for next, 2 for far)
+      - 'is_monthly': bool
+    """
+    if not hint:
+        return None
+    raw = str(hint).strip().upper()
+    if not raw:
+        return None
+
+    # 1. ISO Date: YYYY-MM-DD, YYYY/MM/DD, YYYY.MM.DD
+    m_iso = re.search(r"\b(20\d{2})[-/.](0?[1-9]|1[0-2])[-/.](0?[1-9]|[12]\d|3[01])\b", raw)
+    if m_iso:
+        y, m, d = int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3))
+        return {"type": "exact_date", "year": y, "month": m, "day": d, "iso": f"{y:04d}-{m:02d}-{d:02d}"}
+
+    # 2. Standard numeric: DD-MM-YYYY or DD/MM/YYYY or DD-MM-YY
+    m_num = re.search(r"\b(0?[1-9]|[12]\d|3[01])[-/.](0?[1-9]|1[0-2])[-/.](20\d{2}|\d{2})\b", raw)
+    if m_num:
+        d, m, y_str = int(m_num.group(1)), int(m_num.group(2)), m_num.group(3)
+        y = 2000 + int(y_str) if len(y_str) == 2 else int(y_str)
+        return {"type": "exact_date", "year": y, "month": m, "day": d, "iso": f"{y:04d}-{m:02d}-{d:02d}"}
+
+    months_re = "|".join(sorted(MONTH_NAME_TO_INT.keys(), key=lambda x: len(x), reverse=True))
+
+    # 3. Day + Month (+ optional Year) e.g. '4th Aug Series', '4 Aug', '11 Aug', '28JUL', '4th Aug 2026', '28JUL2026', '28-Jul-2026'
+    m_day_month = re.search(r"\b(0?[1-9]|[12]\d|3[01])(?:ST|ND|RD|TH)?[\s\-_]*(" + months_re + r")(?:\s*[\-_]?\s*(20\d{2}|\d{2}))?\b", raw)
+    if m_day_month:
+        d = int(m_day_month.group(1))
+        m = MONTH_NAME_TO_INT[m_day_month.group(2)]
+        y_str = m_day_month.group(3)
+        y = (2000 + int(y_str) if len(y_str) == 2 else int(y_str)) if y_str else None
+        return {"type": "specific_day_month", "day": d, "month": m, "year": y}
+
+    # 4. Month + 4-digit Year (e.g. 'Aug 2026', 'August 2026 Monthly Series')
+    m_month_year = re.search(r"\b(" + months_re + r")[\s\-_]+(20\d{2})\b", raw)
+    if m_month_year:
+        m = MONTH_NAME_TO_INT[m_month_year.group(1)]
+        y = int(m_month_year.group(2))
+        return {"type": "month_series", "month": m, "year": y, "is_monthly": True}
+
+    # 5. Month + Day (+ optional Year) e.g. 'Aug 4th', 'August 11', 'Aug 4, 2026'
+    m_month_day = re.search(r"\b(" + months_re + r")[\s\-_]+(0?[1-9]|[12]\d|3[01])(?:ST|ND|RD|TH)?(?!\d)(?:\s*[\-_,\s]?\s*(20\d{2}|\d{2}))?\b", raw)
+    if m_month_day:
+        m = MONTH_NAME_TO_INT[m_month_day.group(1)]
+        d = int(m_month_day.group(2))
+        y_str = m_month_day.group(3)
+        y = (2000 + int(y_str) if len(y_str) == 2 else int(y_str)) if y_str else None
+        return {"type": "specific_day_month", "day": d, "month": m, "year": y}
+
+    # 6. Month Only / Month Series e.g. 'Aug Series', 'Aug Monthly', 'August', 'AUG', 'AUG EXPIRY'
+    m_month_only = re.search(r"\b(" + months_re + r")(?:\s*(?:SERIES|EXPIRY|MONTH(?:LY)?|CONTRACT))?\b", raw)
+    if m_month_only:
+        m = MONTH_NAME_TO_INT[m_month_only.group(1)]
+        return {"type": "month_series", "month": m, "year": None, "is_monthly": True}
+
+    # 7. Generic Relative Month (when no specific month name is mentioned)
+    if re.search(r"\bFAR\s+MONTH(?:LY)?\b", raw):
+        return {"type": "relative_month", "offset": 2, "is_monthly": True}
+    if re.search(r"\bNEXT\s+MONTH(?:LY)?\b", raw):
+        return {"type": "relative_month", "offset": 1, "is_monthly": True}
+    if re.search(r"\b(THIS|CURRENT)\s+MONTH(?:LY)?\b|\bMONTHLY\b|\bMONTH\s+END\b", raw):
+        return {"type": "relative_month", "offset": 0, "is_monthly": True}
+
+    # 8. Generic Relative Week
+    if re.search(r"\bNEXT\s+WEEK(?:LY)?\b", raw):
+        return {"type": "relative_week", "offset": 1, "is_weekly": True}
+    if re.search(r"\b(THIS|CURRENT)\s+WEEK(?:LY)?\b|\bWEEKLY\b", raw):
+        return {"type": "relative_week", "offset": 0, "is_weekly": True}
+
+    return {"type": "raw", "raw": raw}
+
+
+def match_candidate_by_expiry(
+    candidates: List[Dict[str, Any]],
+    expiry_hint: Optional[str]
+) -> Dict[str, Any]:
+    """
+    Selects the best matching candidate contract from a list of eligible active candidates
+    (sorted by expiry date ascending) using natural language expiry parsing and explicit distinction
+    between Index Weekly, Index Monthly, and Stock Monthly contracts.
+    
+    If expiry_hint is omitted or cannot be resolved, falls back gracefully to the nearest active expiry.
+    """
+    if not candidates:
+        return {}
+    if not expiry_hint or not str(expiry_hint).strip():
+        return candidates[0]
+
+    clean_hint = str(expiry_hint).strip().upper()
+    parsed = parse_expiry_hint(expiry_hint)
+
+    if parsed:
+        p_type = parsed.get("type")
+
+        # Tier 1: Exact ISO date match (e.g. "2026-08-04")
+        if p_type == "exact_date":
+            target_iso = parsed["iso"]
+            for c in candidates:
+                if c.get("expiry") == target_iso:
+                    return c
+
+        # Tier 2: Specific day + month (+ optional year) (e.g. "4th Aug", "11 Aug", "28JUL", "Aug 4th")
+        if p_type == "specific_day_month":
+            t_day = parsed["day"]
+            t_month = parsed["month"]
+            t_year = parsed.get("year")
+            # 1. Exact day + month match
+            for c in candidates:
+                c_exp = c.get("expiry", "")
+                try:
+                    dt = datetime.strptime(c_exp, "%Y-%m-%d")
+                    if dt.day == t_day and dt.month == t_month:
+                        if t_year is None or dt.year == t_year:
+                            return c
+                except Exception:
+                    pass
+            # 2. Near day match in same month (exchange holiday shift +-2 days)
+            near_match = None
+            min_diff = 999
+            for c in candidates:
+                c_exp = c.get("expiry", "")
+                try:
+                    dt = datetime.strptime(c_exp, "%Y-%m-%d")
+                    if dt.month == t_month and (t_year is None or dt.year == t_year):
+                        diff = abs(dt.day - t_day)
+                        if diff <= 2 and diff < min_diff:
+                            min_diff = diff
+                            near_match = c
+                except Exception:
+                    pass
+            if near_match:
+                return near_match
+
+        # Tier 3: Month series / Monthly contract for specific month (e.g. "Aug Series", "AUG", "August", "August 2026")
+        if p_type == "month_series":
+            t_month = parsed["month"]
+            t_year = parsed.get("year")
+            month_candidates = []
+            for c in candidates:
+                c_exp = c.get("expiry", "")
+                try:
+                    dt = datetime.strptime(c_exp, "%Y-%m-%d")
+                    if dt.month == t_month and (t_year is None or dt.year == t_year):
+                        month_candidates.append((c, is_monthly_contract(c), dt))
+                except Exception:
+                    pass
+            if month_candidates:
+                # Prefer explicit monthly contract (3-letter month code in tradingsymbol)
+                for c, is_m, dt in month_candidates:
+                    if is_m:
+                        return c
+                # Fallback to latest expiry date in that month
+                month_candidates.sort(key=lambda x: x[2], reverse=True)
+                return month_candidates[0][0]
+
+        # Tier 4: Relative month ("Monthly", "Next Month", "Far Month")
+        if p_type == "relative_month":
+            offset = parsed.get("offset", 0)
+            monthly_cands = [c for c in candidates if is_monthly_contract(c)]
+            if monthly_cands:
+                if offset < len(monthly_cands):
+                    return monthly_cands[offset]
+                return monthly_cands[-1]
+
+        # Tier 5: Relative week ("Weekly", "Next Week")
+        if p_type == "relative_week":
+            offset = parsed.get("offset", 0)
+            if offset < len(candidates):
+                return candidates[offset]
+            return candidates[-1]
+
+    # Tier 6: Substring / Tradingsymbol Token match fallback
+    for c in candidates:
+        c_exp = c.get("expiry", "").upper()
+        c_sym = c.get("tradingsymbol", "").upper()
+        if clean_hint in c_exp or clean_hint in c_sym:
+            return c
+
+    # Tier 7: Default to nearest active expiry contract
+    logger.info(
+        f"Expiry hint '{expiry_hint}' could not be matched explicitly. "
+        f"Defaulting to nearest active expiry: {candidates[0].get('expiry')} ({candidates[0].get('tradingsymbol')})"
+    )
+    return candidates[0]
+
+
 def resolve_nfo_instrument(
     underlying: str,
     strike: Optional[float] = None,
@@ -198,6 +437,7 @@ def resolve_nfo_instrument(
     Looks up exact NFO instrument given underlying, strike, option_type, and optional expiry.
     Returns dict with tradingsymbol, instrument_token, lot_size, tick_size, expiry, etc.
     Strictly forbids arbitrary default fallbacks to 'CE' for options.
+    Distinguishes explicitly between Index Weekly, Index Monthly, and Stock Monthly contracts.
     """
     if not underlying:
         return None
@@ -259,18 +499,9 @@ def resolve_nfo_instrument(
     # Sort candidates by expiry date ascending
     candidates.sort(key=lambda x: x.get("expiry", ""))
 
-    # If expiry hint provided, try to find matching candidate
-    if expiry_hint:
-        clean_hint = expiry_hint.strip().upper()
-        for c in candidates:
-            # Check if hint in expiry string (e.g. "2026-08-11" or "AUG" or "28JUL")
-            c_exp = c.get("expiry", "").upper()
-            c_sym = c.get("tradingsymbol", "").upper()
-            if clean_hint in c_exp or clean_hint in c_sym:
-                return format_instrument_result(c)
-
-    # Default to nearest active expiry contract
-    return format_instrument_result(candidates[0])
+    # Resolve matching candidate based on parsed expiry hint or nearest active expiry
+    selected = match_candidate_by_expiry(candidates, expiry_hint)
+    return format_instrument_result(selected)
 
 def get_freeze_quantity(
     tradingsymbol: Optional[str] = None,
