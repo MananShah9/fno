@@ -375,7 +375,7 @@ def is_poke_message(text: Optional[str]) -> bool:
 
 # Define structured schema
 class ActionSchema(BaseModel):
-    action_type: str = Field(description="Must be one of: BUY, SELL, EXIT, UPDATE_SL, CLOSE_LEG, INFO")
+    action_type: str = Field(description="Must be one of: BUY, SELL, EXIT, UPDATE_SL, UPDATE_TARGET, CLOSE_LEG, INFO")
     transaction_type: Optional[str] = Field(description="Zerodha order side: 'BUY' or 'SELL'. For entry: 'BUY' or 'SELL'. For EXIT: if exiting/closing a short position it is 'BUY'; if exiting/closing a long position it is 'SELL'.")
     is_main: Optional[bool] = Field(description="True if this is the primary/main directional leg of the trade, False if it is a hedge leg.")
     is_adjustment: Optional[bool] = Field(description="True if this action represents an averaging or adjustment leg on an existing open trade. False for initial trade entries.")
@@ -544,7 +544,7 @@ def format_open_trades_context(open_trades: Optional[List[Dict[str, Any]]]) -> s
             status = str(leg.get("order_status") or "").upper()
             if status in ["FAILED", "CANCELLED"]:
                 continue
-            if act_type in ["EXIT", "CLOSE_LEG", "UPDATE_SL", "INFO"]:
+            if act_type in ["EXIT", "CLOSE_LEG", "UPDATE_SL", "UPDATE_TARGET", "INFO"]:
                 continue
             valid_legs.append(leg)
 

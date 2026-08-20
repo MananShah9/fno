@@ -458,6 +458,15 @@ def resolve_nfo_instrument(
             )
             return None
 
+    # Conversely, for options ('CE' or 'PE'), strike MUST be provided.
+    # Resolving an option without a strike would pick an arbitrary contract and pollute records.
+    if clean_option_type in ["CE", "PE"] and strike is None:
+        logger.warning(
+            f"Cannot resolve NFO option instrument for underlying={underlying}: "
+            f"strike is missing for option_type '{clean_option_type}'."
+        )
+        return None
+
     candidates = []
     for row in instruments:
         # Match underlying name

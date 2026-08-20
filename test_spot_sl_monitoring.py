@@ -281,6 +281,122 @@ class TestSpotStopLossMonitoring(unittest.TestCase):
         self.assertEqual(sell_act.sl_order_status, "MONITORING")
         self.assertFalse(sell_act.sl_triggered)
 
+    def test_process_trade_actions_bypasses_instrument_resolution_for_update_sl_without_strike(self):
+        """
+        Verify that for actions categorized as UPDATE_SL without strike details
+        (e.g., Message 254: 'Tata steel Trade Plan: SL when stock price hits 186'),
+        process_trade_actions_and_sizing bypasses instrument resolution and does NOT
+        assign an arbitrary tradingsymbol or instrument_token.
+        """
+        trade = Trade(id=254, underlying="TATASTEEL", status="OPEN")
+        self.session.add(trade)
+        self.session.commit()
+
+        parsed_actions = [
+            ActionSchema(
+                action_type="UPDATE_SL",
+                underlying="TATASTEEL",
+                option_type="CE",
+                strike=None,
+                stoploss="when stock price hits 186",
+                sl_trigger_type="UNDERLYING_SPOT_TRIGGER",
+                sl_trigger_price=186.0,
+                sl_trigger_direction="BELOW"
+            )
+        ]
+
+        actions = process_trade_actions_and_sizing(
+            trade=trade,
+            db_message_id=254,
+            parsed_actions=parsed_actions
+        )
+
+        self.assertEqual(len(actions), 1)
+        act = actions[0]
+        self.assertEqual(act.action_type, "UPDATE_SL")
+        self.assertIsNone(act.tradingsymbol)
+        self.assertIsNone(act.instrument_token)
+        self.assertIsNone(act.strike)
+        self.assertEqual(act.sl_trigger_type, "UNDERLYING_SPOT_TRIGGER")
+        self.assertEqual(act.sl_trigger_price, 186.0)
+        self.assertEqual(act.sl_trigger_direction, "BELOW")
+        self.assertTrue(act.sl_monitoring_active)
+        self.assertEqual(act.sl_order_status, "MONITORING")
+
+    def test_process_trade_actions_bypasses_resolution_for_update_target_and_info_without_strike(self):
+        """
+        Verify that UPDATE_TARGET and INFO actions without strike details bypass
+        instrument resolution and do not assign fake tradingsymbols.
+        """
+        trade = Trade(id=300, underlying="TATASTEEL", status="OPEN")
+        self.session.add(trade)
+        self.session.commit()
+
+        parsed_actions = [
+            ActionSchema(
+                action_type="UPDATE_TARGET",
+                underlying="TATASTEEL",
+                target="200.0",
+                strike=None
+            ),
+            ActionSchema(
+                action_type="INFO",
+                underlying="TATASTEEL",
+                details="Trade plan commentary",
+                strike=None
+            )
+        ]
+
+        actions = process_trade_actions_and_sizing(
+            trade=trade,
+            db_message_id=300,
+            parsed_actions=parsed_actions
+        )
+
+        self.assertEqual(len(actions), 2)
+        target_act = actions[0]
+        info_act = actions[1]
+
+        self.assertEqual(target_act.action_type, "UPDATE_TARGET")
+        self.assertIsNone(target_act.tradingsymbol)
+        self.assertIsNone(target_act.instrument_token)
+
+        self.assertEqual(info_act.action_type, "INFO")
+        self.assertIsNone(info_act.tradingsymbol)
+        self.assertIsNone(info_act.instrument_token)
+
+    def test_process_trade_actions_resolves_instrument_for_update_sl_with_explicit_strike(self):
+        """
+        Verify that if an UPDATE_SL action introduces an explicit strike,
+        process_trade_actions_and_sizing resolves the correct instrument.
+        """
+        trade = Trade(id=350, underlying="TATASTEEL", status="OPEN")
+        self.session.add(trade)
+        self.session.commit()
+
+        parsed_actions = [
+            ActionSchema(
+                action_type="UPDATE_SL",
+                underlying="TATASTEEL",
+                option_type="PE",
+                strike=192.5,
+                stoploss="150.0"
+            )
+        ]
+
+        actions = process_trade_actions_and_sizing(
+            trade=trade,
+            db_message_id=350,
+            parsed_actions=parsed_actions
+        )
+
+        self.assertEqual(len(actions), 1)
+        act = actions[0]
+        self.assertEqual(act.action_type, "UPDATE_SL")
+        self.assertEqual(act.tradingsymbol, "TATASTEEL26AUG192.5PE")
+        self.assertEqual(act.strike, 192.5)
+        self.assertEqual(act.option_type, "PE")
+
     # =========================================================================
     # 5. Active Market-Data Spot Stop-Loss Monitoring Loop Tests
     # =========================================================================

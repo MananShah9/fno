@@ -60,7 +60,7 @@ class Action(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     trade_id = Column(Integer, ForeignKey('trades.id'), nullable=True)
     message_id = Column(Integer, ForeignKey('messages.id'), nullable=False)
-    action_type = Column(String, nullable=False)  # "BUY", "SELL", "EXIT", "UPDATE_SL", "CLOSE_LEG", "INFO"
+    action_type = Column(String, nullable=False)  # "BUY", "SELL", "EXIT", "UPDATE_SL", "UPDATE_TARGET", "CLOSE_LEG", "INFO"
     instrument_name = Column(String, nullable=True)  # e.g. "NIFTY 28JUL2026 24000 PE" (Zerodha copyable search)
     price = Column(String, nullable=True)
     stoploss = Column(String, nullable=True)

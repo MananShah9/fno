@@ -292,6 +292,8 @@ def format_important_notice_telegram_html(trade: Trade, unexecuted_actions: list
             action_prefix += "🚪 <b>EXIT:</b> "
         elif act.action_type == "UPDATE_SL":
             action_prefix += "🛡️ <b>UPDATE SL:</b> "
+        elif act.action_type == "UPDATE_TARGET":
+            action_prefix += "🎯 <b>UPDATE TARGET:</b> "
         else:
             action_prefix += "ℹ️ <b>ACTION:</b> "
 
@@ -367,7 +369,7 @@ def format_spot_sl_triggered_telegram_html(trade: Trade, action: Action, spot_lt
 def format_action_telegram_message_html(trade: Trade, actions: list) -> str:
     """Formats actions into a beautiful Telegram HTML message with Zerodha execution info."""
     is_exit = any(a.action_type == 'EXIT' for a in actions)
-    is_update = any(a.action_type in ['UPDATE_SL', 'CLOSE_LEG', 'INFO'] for a in actions)
+    is_update = any(a.action_type in ['UPDATE_SL', 'UPDATE_TARGET', 'CLOSE_LEG', 'INFO'] for a in actions)
     is_adj = any(getattr(a, "is_adjustment", False) for a in actions)
     
     msg_parts = []
@@ -402,6 +404,8 @@ def format_action_telegram_message_html(trade: Trade, actions: list) -> str:
             action_prefix += "🚪 <b>EXIT:</b> "
         elif action.action_type == "UPDATE_SL":
             action_prefix += "🛡️ <b>UPDATE SL:</b> "
+        elif action.action_type == "UPDATE_TARGET":
+            action_prefix += "🎯 <b>UPDATE TARGET:</b> "
         elif action.action_type == "CLOSE_LEG":
             action_prefix += "❌ <b>CLOSE LEG:</b> "
         else:
@@ -1170,6 +1174,12 @@ def process_trade_actions_and_sizing(
             }
             if pa_ot and not o_type:
                 o_type = pa_ot
+        elif action_type in ["UPDATE_SL", "UPDATE_TARGET", "INFO"]:
+            # Bypass instrument resolution entirely for metadata/update actions unless an explicit new contract strike is being introduced
+            if strike_val is not None and u_symbol:
+                inst = resolve_nfo_instrument(u_symbol, strike_val, o_type, expiry_str)
+            else:
+                inst = None
         elif u_symbol:
             inst = resolve_nfo_instrument(u_symbol, strike_val, o_type, expiry_str)
 
@@ -2335,7 +2345,7 @@ async def process_single_message(session: Session, db_message: Message, actions_
 
                 if candidate_trade:
                     has_new_structure = bool(analysis.structure_type and candidate_trade.structure_type and analysis.structure_type.upper() != candidate_trade.structure_type.upper() and not candidate_trade.structure_type.startswith(analysis.structure_type))
-                    if not has_new_structure or analysis.is_continuation or analysis.trade_status_update == "CLOSED" or is_emergency_exit_phrase(db_message.text) or any(a.action_type in ["EXIT", "CLOSE_LEG", "UPDATE_SL"] for a in analysis.actions) or not analysis.actions:
+                    if not has_new_structure or analysis.is_continuation or analysis.trade_status_update == "CLOSED" or is_emergency_exit_phrase(db_message.text) or any(a.action_type in ["EXIT", "CLOSE_LEG", "UPDATE_SL", "UPDATE_TARGET"] for a in analysis.actions) or not analysis.actions:
                         trade = candidate_trade
                         logger.info(f"Fallback mapped message ID {db_message.id} to open Trade ID {trade.id} ({candidate_trade.underlying})")
 
@@ -2467,7 +2477,11 @@ async def process_single_message(session: Session, db_message: Message, actions_
                     session=session
                 )
 
-        unresolved = [a.instrument_name or a.action_type for a in db_actions if not a.tradingsymbol]
+        unresolved = [
+            a.instrument_name or a.action_type
+            for a in db_actions
+            if not a.tradingsymbol and a.action_type not in ["UPDATE_SL", "UPDATE_TARGET", "INFO"]
+        ]
         if unresolved:
             ctx.set_warning(f"Could not resolve NFO tradingsymbol for: {', '.join(unresolved)}")
 

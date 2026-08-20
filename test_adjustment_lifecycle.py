@@ -825,6 +825,7 @@ class TestTradeAdjustmentLifecycle(unittest.TestCase):
         - When strike is specified and option_type is None, returns None (no arbitrary 'CE' fallback).
         - When strike and option_type='PE' are specified, returns exact PE instrument.
         - When strike and option_type='CE' are specified, returns exact CE instrument.
+        - When option_type='CE' or 'PE' is specified without strike, returns None (no arbitrary contract picking).
         """
         # Strike with None option_type -> MUST return None
         res_none = resolve_nfo_instrument("NIFTY", strike=24600.0, option_type=None)
@@ -833,6 +834,14 @@ class TestTradeAdjustmentLifecycle(unittest.TestCase):
         # Strike with empty string option_type -> MUST return None
         res_empty = resolve_nfo_instrument("NIFTY", strike=24600.0, option_type="")
         self.assertIsNone(res_empty)
+
+        # Option type CE without strike -> MUST return None
+        res_ce_no_strike = resolve_nfo_instrument("TATASTEEL", strike=None, option_type="CE")
+        self.assertIsNone(res_ce_no_strike)
+
+        # Option type PE without strike -> MUST return None
+        res_pe_no_strike = resolve_nfo_instrument("TATASTEEL", strike=None, option_type="PE")
+        self.assertIsNone(res_pe_no_strike)
 
         # Strike with explicit 'PE' -> resolves PE
         res_pe = resolve_nfo_instrument("NIFTY", strike=24600.0, option_type="PE")
