@@ -26,7 +26,8 @@ For every message ingested from Telegram, the system automatically records a det
 | :--- | :--- | :--- |
 | `SYNC_RECEIVED` | Raw message ingested from Telegram channel | `SUCCESS` |
 | `POKE_FILTER` | Message is identified as a poke ping (`.` or `trade incoming`) and skipped | `SKIPPED` |
-| `TIME_WINDOW_FILTER` | Message sent outside configured active hours or weekdays; skipped from processing | `SKIPPED` |
+| `ORDER_HELD_FOR_MARKET_OPEN` | Order held in READY_FOR_MARKET_OPEN queue outside market hours (24/7 ingestion) | `INFO` |
+| `MARKET_OPEN_QUEUE_PROCESSED` | Queued pre-market orders dispatched on market open | `SUCCESS`, `WARNING` |
 | `MESSAGE_EDIT_DETECTED` | Edit event received for a message | `INFO` |
 | `EDIT_REPROCESSING_STARTED`| Reprocessing triggered with incremented revision | `INFO` |
 | `EDIT_REPROCESSING_SKIPPED`| Edit skipped because actions were already executed for the original message | `SKIPPED` |

@@ -44,7 +44,9 @@ def format_status_badge(status: str) -> str:
 
 def format_order_status_badge(order_status: str, filled_qty: int = 0, total_qty: int = 0) -> str:
     st = str(order_status or "PENDING").upper()
-    if st in ["FILLED", "EXECUTED"]:
+    if st == "READY_FOR_MARKET_OPEN":
+        return "🌅 READY_FOR_OPEN"
+    elif st in ["FILLED", "EXECUTED"]:
         return "✅ FILLED"
     elif st == "OPEN_LIMIT":
         return "⏳ OPEN_LIMIT"

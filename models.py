@@ -84,7 +84,7 @@ class Action(Base):
     transaction_type = Column(String, nullable=True)  # "BUY" or "SELL"
     order_type = Column(String, nullable=True)        # "MARKET" or "LIMIT"
     product = Column(String, default="NRML")           # "NRML" or "MIS"
-    order_status = Column(String, default="PENDING", index=True)  # "PENDING", "SUBMITTED", "OPEN_LIMIT", "TRIGGER_PENDING", "PARTIAL_FILL", "FILLED", "EXECUTED", "REJECTED", "CANCELLED", "FAILED", "PLACED"
+    order_status = Column(String, default="PENDING", index=True)  # "PENDING", "READY_FOR_MARKET_OPEN", "SUBMITTED", "OPEN_LIMIT", "TRIGGER_PENDING", "PARTIAL_FILL", "FILLED", "EXECUTED", "REJECTED", "CANCELLED", "FAILED", "PLACED"
     filled_quantity = Column(Integer, default=0)       # Actual filled quantity confirmed by broker/exchange
     pending_quantity = Column(Integer, default=0)      # Unfilled quantity remaining open on exchange
     average_price = Column(Float, nullable=True)       # Executed average fill price

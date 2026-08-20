@@ -442,8 +442,12 @@ def format_action_telegram_message_html(trade: Trade, actions: list) -> str:
             action_line += f"({', '.join(detail_parts)})"
 
         if action.order_status and action.order_status != "PENDING":
-            status_icon = "✅" if action.order_status in ["PLACED", "EXECUTED", "FILLED"] else ("⏳" if action.order_status in ["OPEN_LIMIT", "SUBMITTED", "TRIGGER_PENDING", "PARTIAL_FILL"] else "❌")
-            action_line += f"\n  Status: {status_icon} <b>{action.order_status}</b>"
+            if action.order_status == "READY_FOR_MARKET_OPEN":
+                status_icon = "🌅"
+                action_line += f"\n  Status: {status_icon} <b>READY_FOR_MARKET_OPEN</b> (Pre-market queue)"
+            else:
+                status_icon = "✅" if action.order_status in ["PLACED", "EXECUTED", "FILLED"] else ("⏳" if action.order_status in ["OPEN_LIMIT", "SUBMITTED", "TRIGGER_PENDING", "PARTIAL_FILL"] else "❌")
+                action_line += f"\n  Status: {status_icon} <b>{action.order_status}</b>"
             if action.filled_quantity and action.filled_quantity > 0:
                 fill_str = f" (Filled: {action.filled_quantity}/{action.quantity or action.filled_quantity}"
                 if action.average_price and action.average_price > 0:
@@ -1189,7 +1193,7 @@ def process_trade_actions_and_sizing(
             "underlying": u_symbol,
             "option_type": o_type,
             "strike": strike_val,
-            "expiry": inst["expiry"] if inst else expiry_str,
+            "expiry": (inst.get("expiry", expiry_str) if isinstance(inst, dict) else expiry_str) if inst else expiry_str,
             "inst": inst,
             "is_main": True,
             "is_adjustment": is_adj_leg,
@@ -1483,12 +1487,13 @@ def execute_trade_actions(
       - Phase 2: Waits for successful BUY confirmation before placing SELL (short/main) legs to guarantee
                  Zerodha / exchange margin relief (~35k vs ~1.5L) and prevent unhedged naked short exposure.
     If auto_mode is True, checks AUTO_PLACE_ORDERS for entry actions and AUTO_PLACE_EXIT_ORDERS for exit actions.
+    If time filter is active and outside market hours in auto_mode, holds actionable orders in READY_FOR_MARKET_OPEN queue.
     If allow_failed_retry is False (default), terminal FAILED actions are never automatically re-submitted.
     """
     auto_entry = os.getenv("AUTO_PLACE_ORDERS", "false").lower() in ("true", "1", "t", "yes")
     auto_exit = os.getenv("AUTO_PLACE_EXIT_ORDERS", "false").lower() in ("true", "1", "t", "yes")
 
-    target_statuses = ["PENDING", "FAILED"] if allow_failed_retry else ["PENDING"]
+    target_statuses = ["PENDING", "READY_FOR_MARKET_OPEN", "FAILED"] if allow_failed_retry else ["PENDING", "READY_FOR_MARKET_OPEN"]
 
     if actions is None:
         actions = session.query(Action).filter(
@@ -1548,7 +1553,7 @@ def execute_trade_actions(
 
         is_exit = action.action_type in ["EXIT", "CLOSE_LEG"]
 
-        # If in automated background mode, check feature flags
+        # If in automated background mode, check feature flags and time schedule filter
         if auto_mode:
             if is_exit and not auto_exit:
                 logger.info(f"Skipping auto-placement for Exit Action ID {action.id} (AUTO_PLACE_EXIT_ORDERS is false).")
@@ -1587,6 +1592,39 @@ def execute_trade_actions(
                     "skipped_auto": True,
                     "order_id": None,
                     "message": "AUTO_PLACE_ORDERS is false"
+                }
+
+            is_active, sched_reason = is_telegram_time_active()
+            if not is_active:
+                logger.info(f"Order placement for Action ID {action.id} held in READY_FOR_MARKET_OPEN queue: {sched_reason}")
+                action.order_status = "READY_FOR_MARKET_OPEN"
+                action.zerodha_response = f"Held in READY_FOR_MARKET_OPEN queue: {sched_reason}"
+                session.commit()
+
+                record_stage(
+                    stage="ORDER_HELD_FOR_MARKET_OPEN",
+                    status="INFO",
+                    message_id=action.message_id,
+                    trade_id=action.trade_id,
+                    details={
+                        "action_id": action.id,
+                        "tradingsymbol": action.tradingsymbol,
+                        "quantity": action.quantity,
+                        "action_type": action.action_type,
+                        "reason": sched_reason,
+                        "order_status": "READY_FOR_MARKET_OPEN"
+                    },
+                    session=session
+                )
+                return {
+                    "action_id": action.id,
+                    "tradingsymbol": action.tradingsymbol,
+                    "success": False,
+                    "confirmed": False,
+                    "held_for_market_open": True,
+                    "status": "READY_FOR_MARKET_OPEN",
+                    "order_id": None,
+                    "message": f"Held in READY_FOR_MARKET_OPEN queue: {sched_reason}"
                 }
 
         # 1. Deduplication check against existing Zerodha orders & positions
@@ -1800,11 +1838,11 @@ def execute_trade_actions(
             r = _execute_single_action(act)
             results.append(r)
             if not r["success"] or not r.get("confirmed", False):
-                if not r.get("skipped_auto"):
+                if not r.get("skipped_auto") and not r.get("held_for_market_open"):
                     hedge_failed = True
                     failed_hedge_symbols.append(act.tradingsymbol or f"Action #{act.id}")
 
-        if not hedge_failed and not any(r.get("skipped_auto") for r in results):
+        if not hedge_failed and not any(r.get("skipped_auto") or r.get("held_for_market_open") for r in results):
             logger.info(f"Phase 1 SUCCESS: All BUY/hedge legs confirmed on exchange for Trade #{trade_id}.")
             record_stage(
                 stage="HEDGE_LEGS_CONFIRMED",
@@ -1907,7 +1945,7 @@ def setup_telegram_event_handlers():
                     # Check if pending actions exist
                     pending_acts = session.query(Action).filter(
                         Action.trade_id == trade_id,
-                        Action.order_status == "PENDING",
+                        Action.order_status.in_(["PENDING", "READY_FOR_MARKET_OPEN"]),
                         Action.action_type.in_(["BUY", "SELL", "EXIT", "CLOSE_LEG"])
                     ).all()
 
@@ -1991,12 +2029,6 @@ def setup_telegram_event_handlers():
                 (getattr(source_entity, "id", None) == getattr(event.chat, "id", None))
             )
             if not is_match:
-                return
-
-            # Check if message edit is within active Telegram schedule
-            is_active, sched_reason = is_telegram_time_active(msg.date or datetime.utcnow())
-            if not is_active:
-                logger.info(f"Message edit event for Message ID {msg.id} ignored: {sched_reason}")
                 return
 
             logger.info(f"✏️ Message edit detected for Message ID {msg.id} in source channel.")
@@ -2150,26 +2182,6 @@ async def process_single_message(session: Session, db_message: Message, actions_
             session=session
         )
         return True
-
-    # Check if message timestamp falls within configured active schedule
-    if db_message.date:
-        is_active, sched_reason = is_telegram_time_active(db_message.date)
-        if not is_active:
-            logger.info(f"Message ID {db_message.id} (date: {db_message.date}) skipped by schedule filter: {sched_reason}")
-            record_stage(
-                stage="TIME_WINDOW_FILTER",
-                status="SKIPPED",
-                message_id=db_message.id,
-                telegram_message_id=db_message.telegram_message_id,
-                revision=rev,
-                details={"reason": sched_reason, "msg_date": str(db_message.date)},
-                session=session
-            )
-            db_message.analysed_by_ai = True
-            db_message.processed = True
-            db_message.processed_at = datetime.utcnow()
-            session.commit()
-            return True
 
     if is_poke_message(db_message.text):
         logger.info(f"Message ID {db_message.id} is a poke message ('{db_message.text.strip()}'). Skipping processing.")
@@ -2554,9 +2566,9 @@ async def process_single_message(session: Session, db_message: Message, actions_
                     
                 html_msg = format_action_telegram_message_html(trade, db_actions)
 
-                # If any actionable orders remain PENDING, show "Place Order(s)" inline button
+                # If any actionable orders remain PENDING or READY_FOR_MARKET_OPEN, show "Place Order(s)" inline button
                 has_pending_orders = any(
-                    a.order_status == "PENDING" and a.action_type in ["BUY", "SELL", "EXIT", "CLOSE_LEG"]
+                    a.order_status in ["PENDING", "READY_FOR_MARKET_OPEN"] and a.action_type in ["BUY", "SELL", "EXIT", "CLOSE_LEG"]
                     for a in db_actions
                 )
 
@@ -2763,14 +2775,88 @@ async def check_active_spot_stoplosses(actions_entity=None, session: Optional[Se
         if close_sess and s:
             s.close()
 
-async def sync_and_process():
-    """Main worker iteration to sync messages and run Gemini processing."""
-    # Check if currently within active Telegram schedule
+async def process_ready_for_market_open_orders(actions_entity=None, session: Optional[Session] = None) -> List[Dict[str, Any]]:
+    """
+    Scans the database for actionable orders queued in READY_FOR_MARKET_OPEN state.
+    When market hours / schedule become active and auto placement is enabled:
+      1. Dispatches orders to Zerodha in proper Phase 1 (BUY) / Phase 2 (SELL) ordering.
+      2. Updates Action order statuses based on broker responses.
+      3. Sends Telegram notifications to actions channel reporting market-open execution.
+    """
     is_active, sched_reason = is_telegram_time_active()
     if not is_active:
-        logger.info(f"Sync skipped: {sched_reason}")
-        return
+        return []
 
+    close_sess = False
+    s = session
+    if s is None:
+        s = db.SessionLocal()
+        close_sess = True
+
+    try:
+        queued_actions = s.query(Action).filter(
+            Action.order_status == "READY_FOR_MARKET_OPEN",
+            Action.action_type.in_(["BUY", "SELL", "EXIT", "CLOSE_LEG"])
+        ).order_by(Action.id.asc()).all()
+
+        if not queued_actions:
+            return []
+
+        logger.info(f"[MARKET OPEN] Market hours active: Found {len(queued_actions)} queued READY_FOR_MARKET_OPEN action(s). Processing...")
+
+        # Group by trade_id
+        trades_map: Dict[int, List[Action]] = {}
+        for act in queued_actions:
+            t_id = act.trade_id or 0
+            if t_id not in trades_map:
+                trades_map[t_id] = []
+            trades_map[t_id].append(act)
+
+        all_results = []
+        for trade_id, actions_list in trades_map.items():
+            trade = s.query(Trade).filter(Trade.id == trade_id).first() if trade_id else None
+
+            logger.info(f"Executing market open orders for Trade #{trade_id} ({len(actions_list)} action(s))...")
+            exec_results = execute_trade_actions(s, trade_id, auto_mode=True, actions=actions_list, allow_failed_retry=False)
+            all_results.extend(exec_results)
+
+            record_stage(
+                stage="MARKET_OPEN_QUEUE_PROCESSED",
+                status="SUCCESS" if any(r.get("success") for r in exec_results) else "WARNING",
+                trade_id=trade_id if trade_id else None,
+                details={
+                    "trade_id": trade_id,
+                    "actions_count": len(actions_list),
+                    "results": exec_results
+                },
+                session=s
+            )
+
+            # Send Telegram update if actions_entity is configured
+            if actions_entity and client and trade:
+                try:
+                    s.refresh(trade)
+                    for a in actions_list:
+                        s.refresh(a)
+
+                    # Build execution notification HTML
+                    lines = [f"🌅 <b>Market Open Execution Triggered for Trade #{trade_id}:</b>\n"]
+                    for r in exec_results:
+                        icon = "✅" if r.get("success") else "❌"
+                        status_desc = f"Order ID: <code>{r.get('order_id')}</code> ({r.get('status')})" if r.get("success") else f"Error: {r.get('message')}"
+                        lines.append(f"{icon} <code>{r.get('tradingsymbol')}</code> -> {status_desc}")
+
+                    await client.send_message(actions_entity, "\n".join(lines), parse_mode='html')
+                except Exception as te:
+                    logger.error(f"Failed to send market open Telegram alert for Trade #{trade_id}: {te}")
+
+        return all_results
+    finally:
+        if close_sess and s:
+            s.close()
+
+async def sync_and_process():
+    """Main worker iteration to sync messages 24/7 and run Gemini processing."""
     source_channel_id = os.getenv("TELEGRAM_SOURCE_CHANNEL")
     mirror_channel_id = os.getenv("TELEGRAM_MIRROR_CHANNEL")
     actions_channel_id = os.getenv("TELEGRAM_ACTIONS_CHANNEL")
@@ -2801,45 +2887,18 @@ async def sync_and_process():
     # Create DB Session
     session = db.SessionLocal()
     try:
+        # Check and process any pending market-open queued orders if market hours are active
+        await process_ready_for_market_open_orders(actions_entity, session=session)
+
         # Find maximum message ID processed
         max_msg_row = session.query(Message).filter(Message.channel_id == str(source_channel_id)).order_by(Message.telegram_message_id.desc()).first()
         min_id = max_msg_row.telegram_message_id if max_msg_row else 0
 
-        logger.info(f"Syncing messages since ID {min_id} (progressive)...")
+        logger.info(f"Syncing messages since ID {min_id} (progressive 24/7 ingestion)...")
 
         # Fetch messages in chronological order (reverse=True)
         async for msg in client.iter_messages(source_entity, min_id=min_id, reverse=True):
             if not msg.text:
-                continue
-
-            # Check if message timestamp falls within active schedule
-            msg_active, msg_sched_reason = is_telegram_time_active(msg.date)
-            if not msg_active:
-                logger.info(f"Skipping message ID {msg.id} (sent at {msg.date}): {msg_sched_reason}")
-                # Store message as processed to advance sync min_id without triggering trade analysis/actions
-                db_message = Message(
-                    telegram_message_id=msg.id,
-                    channel_id=str(source_channel_id),
-                    date=msg.date,
-                    text=msg.text,
-                    processed=True,
-                    analysed_by_ai=True,
-                    processed_at=datetime.utcnow(),
-                    revision=0
-                )
-                session.add(db_message)
-                session.commit()
-                session.refresh(db_message)
-
-                record_stage(
-                    stage="TIME_WINDOW_FILTER",
-                    status="SKIPPED",
-                    message_id=db_message.id,
-                    telegram_message_id=msg.id,
-                    revision=0,
-                    details={"reason": msg_sched_reason, "msg_date": str(msg.date), "raw_text": msg.text[:80]},
-                    session=session
-                )
                 continue
 
             if is_poke_message(msg.text):
@@ -2935,8 +2994,9 @@ async def sync_and_process():
             for db_message in unanalysed_messages:
                 await process_single_message(session, db_message, actions_entity)
 
-        # Reconcile active orders and check spot stoplosses after processing messages
+        # Reconcile active orders, process any queued orders, and check spot stoplosses
         reconcile_active_orders(session)
+        await process_ready_for_market_open_orders(actions_entity, session=session)
         await check_active_spot_stoplosses(actions_entity, session=session)
 
     except Exception as e:
@@ -2946,7 +3006,7 @@ async def sync_and_process():
         session.close()
 
 async def worker_loop():
-    """Worker loop that runs periodically."""
+    """Worker loop that runs periodically (24/7 ingestion with schedule-aware execution)."""
     logger.info("Initializing DB tables...")
     db.init_db()
     
@@ -2954,22 +3014,11 @@ async def worker_loop():
     setup_telegram_event_handlers()
 
     logger.info(f"Telegram active schedule: {get_schedule_description()}")
-    logger.info("Starting background sync and processing loop...")
-    
-    last_inactive_log_time = 0.0
+    logger.info("Starting background sync and processing loop (24/7 message ingestion & parsing)...")
 
     while True:
         try:
-            is_active, sched_reason = is_telegram_time_active()
-            if not is_active:
-                now_sec = asyncio.get_event_loop().time()
-                # Log once every 60 seconds when waiting outside active hours
-                if now_sec - last_inactive_log_time >= 60.0:
-                    logger.info(f"⏳ {sched_reason}. Pausing Telegram sync.")
-                    last_inactive_log_time = now_sec
-            else:
-                last_inactive_log_time = 0.0
-                await sync_and_process()
+            await sync_and_process()
         except Exception as e:
             logger.error(f"Unhandled error in worker main loop: {e}")
         

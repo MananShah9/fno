@@ -141,7 +141,9 @@ def is_telegram_time_active(
 ) -> Tuple[bool, str]:
     """
     Checks if a given datetime (or the current time if dt is None) falls within
-    the configured Telegram allowed time window and weekday schedule.
+    the configured market / order execution active time window and weekday schedule.
+    Governs whether orders are allowed to be transmitted to the broker vs held in
+    the READY_FOR_MARKET_OPEN queue (while message ingestion & AI parsing runs 24/7).
 
     Returns:
         (is_active: bool, reason: str)
